@@ -1,0 +1,4 @@
+# Mac side: live viewer (and later, training)
+numpy
+opencv-python
+pyzmq

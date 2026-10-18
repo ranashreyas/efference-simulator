@@ -1,0 +1,6 @@
+# Raspberry Pi side: capture, actuators, streaming, inference
+numpy
+opencv-python-headless
+onnxruntime
+pyzmq
+linuxpy
