@@ -1,12 +1,13 @@
 """Record household video with the Pi and bring it to the Mac. Run on the Mac.
 
-    .venv/bin/python tools/record.py --scene kitchen --split train          # normal life
-    .venv/bin/python tools/record.py --scene kitchen --split test --view    # with live viewer
-    .venv/bin/python tools/record.py --pull-only                            # just fetch episodes
+    .venv/bin/python tools/record.py                          # record until Ctrl-C
+    .venv/bin/python tools/record.py --scene kitchen --view   # name it, open the live viewer
+    .venv/bin/python tools/record.py --pull-only              # just fetch episodes
 
+Record ordinary household life in sessions of any length (10-30 min keeps files manageable).
 Recording happens on the Pi's SD card (so a WiFi hiccup can't drop frames). Press Ctrl-C to
 stop; the Pi finishes writing the episode, then every episode not yet on the Mac is copied
-into recordings/ here. Label them afterwards with tools/label.py.
+into recordings/ here. Labeling events with tools/label.py is optional.
 """
 import argparse
 import os
@@ -58,14 +59,12 @@ def check(ep):
     size_mb = sum(f.stat().st_size for f in ep.iterdir()) / 1e6
     status = "OK" if not problems else "CHECK: " + "; ".join(problems)
     print(f"  {ep.name}: {len(seqs)} frames ({len(seqs) / 30:.0f} s), {size_mb:.0f} MB, "
-          f"{meta.get('scene', '?')}/{meta.get('split', '?')}  {status}")
+          f"scene {meta.get('scene', '?')}  {status}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", default="home", help="where the camera is, e.g. kitchen, living_room")
-    ap.add_argument("--split", choices=["train", "test"], default="train",
-                    help="train = ordinary life; test = includes events you will label as anomalies")
+    ap.add_argument("--scene", default="home", help="optional name, e.g. kitchen, living_room")
     ap.add_argument("--duration", type=float, default=0, help="seconds (0 = until Ctrl-C)")
     ap.add_argument("--view", action="store_true", help="also open the live viewer")
     ap.add_argument("--pull-only", action="store_true", help="don't record; just copy episodes")
@@ -77,7 +76,7 @@ def main():
 
     if not args.pull_only:
         remote = (f"cd {args.pi_dir} && . .venv/bin/activate && python -u -m eye.run --log "
-                  f"--scene {shlex.quote(args.scene)} --split {args.split}")
+                  f"--scene {shlex.quote(args.scene)}")
         if args.duration:
             remote += f" --duration {args.duration}"
         viewer = None
@@ -85,7 +84,7 @@ def main():
             host_only = args.host.split("@")[-1]
             viewer = subprocess.Popen([sys.executable, "-m", "viewer.view", "--host", host_only],
                                       cwd=PROJECT, stdout=subprocess.DEVNULL)
-        print(f"Recording {args.scene}/{args.split} on the Pi. Press Ctrl-C to stop.", flush=True)
+        print(f"Recording {args.scene} on the Pi. Press Ctrl-C to stop.", flush=True)
         try:
             # -t gives the remote process a terminal, so Ctrl-C reaches it and it can finish
             # writing the episode cleanly before we copy anything.
@@ -98,7 +97,7 @@ def main():
 
     new = pull(args.host, args.pi_dir, out)
     if new:
-        print("\nLabel with:")
+        print("\nOptionally label events with:")
         for name in new:
             print(f"  .venv/bin/python tools/label.py recordings/{name}")
 

@@ -1,15 +1,17 @@
 """Reading and writing recorded episodes. Shared by the Pi logger, the Mac labeler and training.
 
 An episode directory holds:
-    meta.json          camera / actuator settings, scene, split, frame counts
+    meta.json          camera / actuator settings, scene, frame counts
     chunk_0000.npz     model data: grayscale full frames at LOG_SIZE plus per-frame timestamps
                        and eye state (see logger.py)
     preview.mp4        color video at PREVIEW_SIZE for a human to watch; video frame i is
                        logged frame i
-    labels.json        anomaly intervals in frame indices (and camera seq numbers)
-    labels.npy         per-frame 0/1 anomaly label, one entry per logged frame
+    labels.json        optional, written by tools/label.py: event intervals in frame indices
+                       (and camera seq numbers)
+    labels.npy         optional: per-frame 0/1 event label, one entry per logged frame
 
-Frame index i always means "the i-th logged frame", in every file above.
+Frame index i always means "the i-th logged frame", in every file above. The model trains on
+every frame except the held-out part (see holdout_split); labels are only used to score it.
 """
 import glob
 import json
@@ -35,6 +37,7 @@ def frame_index(ep_dir):
 
 
 def load_meta(ep_dir):
+    """meta.json as a dict ({} if missing). Older episodes may carry a "split" key; ignore it."""
     path = os.path.join(ep_dir, "meta.json")
     if not os.path.exists(path):
         return {}
@@ -57,8 +60,8 @@ def merge_intervals(intervals, n_frames):
 
 
 def load_labels(ep_dir, seqs=None):
-    """Anomaly intervals as inclusive (start_frame, end_frame) pairs. Also reads the older
-    live-label format that stored camera seq numbers only."""
+    """Event intervals as inclusive (start_frame, end_frame) pairs. Also reads older files that
+    stored camera seq numbers only."""
     path = os.path.join(ep_dir, "labels.json")
     if not os.path.exists(path):
         return []
@@ -77,7 +80,7 @@ def load_labels(ep_dir, seqs=None):
     return out
 
 
-def save_labels(ep_dir, intervals, seqs, source):
+def save_labels(ep_dir, intervals, seqs):
     """Write labels.json (intervals) and labels.npy (per-frame 0/1). Returns the merged intervals."""
     n = len(seqs)
     merged = merge_intervals(intervals, n) if n else []
@@ -87,10 +90,24 @@ def save_labels(ep_dir, intervals, seqs, source):
     np.save(os.path.join(ep_dir, "labels.npy"), per_frame)
     with open(os.path.join(ep_dir, "labels.json"), "w") as f:
         json.dump(dict(
-            source=source,
             frames=n,
-            anomalous_frames=int(per_frame.sum()),
+            event_frames=int(per_frame.sum()),
             intervals=[dict(start_frame=int(a), end_frame=int(b),
                             start_seq=int(seqs[a]), end_seq=int(seqs[b])) for a, b in merged],
         ), f, indent=2)
     return merged
+
+
+def holdout_split(episode_dirs, fraction=0.15):
+    """Frames held out from training for evaluation: the last `fraction` of every episode.
+
+    Returns {ep_dir: range of held-out frame indices}; train on the frames before it and score
+    surprise against labels inside it. Scoring the model on frames it trained on would hide
+    whether it generalizes. A block at the end (rather than random frames) keeps held-out frames
+    away from the near-identical neighbouring frames the model saw in training.
+    """
+    out = {}
+    for ep in sorted(episode_dirs):
+        n = len(frame_index(ep)[0])
+        out[ep] = range(n - int(round(n * fraction)), n)
+    return out

@@ -1,5 +1,5 @@
 """Episode logger: writes frames, eye state and motor commands to disk in chunks, plus a color
-preview video for labeling. File layout is described in episode.py.
+preview video for watching and labeling later. File layout is described in episode.py.
 
     recordings/<episode>/chunk_0000.npz   frames (N, H, W) uint8 grayscale full frame at LOG_SIZE,
                                           seq, t_sensor, t_host, pan, tilt, pan_target, tilt_target,
@@ -17,7 +17,6 @@ import time
 import cv2
 import numpy as np
 
-from .episode import save_labels
 from .preprocess import LOG_SIZE, PREVIEW_SIZE, to_gray_small
 
 
@@ -31,8 +30,6 @@ class EpisodeLogger:
         self._meta = dict(meta or {}, log_size=LOG_SIZE, preview_size=PREVIEW_SIZE,
                           started=time.time())
         self._rows, self._frames, self._cmds = [], [], []
-        self._all_seqs = []             # every logged frame's seq, in order
-        self._labels = []               # live labels from the viewer: [{"start_seq", "end_seq"}]
         self._chunk = 0
         self.frames_written = 0
         self.preview_frames = 0
@@ -46,7 +43,6 @@ class EpisodeLogger:
     def add(self, frame, state):
         self._frames.append(to_gray_small(frame.img, LOG_SIZE))
         self._video_q.put(cv2.resize(frame.img, PREVIEW_SIZE, interpolation=cv2.INTER_AREA))
-        self._all_seqs.append(frame.seq)
         self._rows.append((frame.seq, frame.t_sensor, frame.t_host,
                            state.pan, state.tilt, state.pan_target, state.tilt_target))
         if len(self._frames) >= self.chunk_frames:
@@ -54,35 +50,6 @@ class EpisodeLogger:
 
     def add_command(self, cmd):
         self._cmds.append((cmd.t_issue, cmd.pan, cmd.tilt))
-
-    # ---- optional live labels from the viewer (offline labeling happens on the Mac) ----------
-    @property
-    def label_active(self):
-        return bool(self._labels) and self._labels[-1]["end_seq"] is None
-
-    @property
-    def label_count(self):
-        return len(self._labels)
-
-    def add_label(self, event):
-        """event: {"state": "start"|"end", "seq": frame the viewer was showing, ...}"""
-        if event["state"] == "start" and not self.label_active:
-            self._labels.append(dict(start_seq=event["seq"], end_seq=None))
-        elif event["state"] == "end" and self.label_active:
-            self._labels[-1]["end_seq"] = event["seq"]
-
-    def _write_labels(self):
-        seqs = np.array(self._all_seqs, dtype=np.int64)
-        if self.label_active:                       # still open when recording stopped
-            self._labels[-1]["end_seq"] = int(seqs[-1]) if len(seqs) else None
-        intervals = []
-        for lab in self._labels:
-            if lab["end_seq"] is not None:
-                a = int(np.searchsorted(seqs, lab["start_seq"]))
-                b = int(np.searchsorted(seqs, lab["end_seq"], side="right")) - 1
-                intervals.append((a, b))
-        merged = save_labels(self.dir, intervals, seqs, source="live")
-        return sum(b - a + 1 for a, b in merged)
 
     # ---- background writers ------------------------------------------------------------------
     def _flush(self):
@@ -129,11 +96,9 @@ class EpisodeLogger:
         self._video_q.put(None)
         self._thread.join()
         self._video_thread.join()
-        anomalous = self._write_labels()
         self._meta.update(frames=self.frames_written, preview_frames=self.preview_frames,
                           chunks=self._chunk, ended=time.time(),
-                          duration_s=round(self.frames_written / self.fps, 1),
-                          live_label_intervals=len(self._labels), anomalous_frames=anomalous)
+                          duration_s=round(self.frames_written / self.fps, 1))
         with open(os.path.join(self.dir, "meta.json"), "w") as f:
             json.dump(self._meta, f, indent=2)
         print(f"[logger] wrote {self.frames_written} frames ({self.frames_written / self.fps:.0f} s) "

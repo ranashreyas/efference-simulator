@@ -1,6 +1,7 @@
-"""Label anomalies in a recorded episode, after the fact. Run on the Mac.
+"""Label events (a person entering the frame, fast movement, ...) in a recorded episode, after
+the fact. Run on the Mac. Optional: the model trains on all video; labels only score it.
 
-    .venv/bin/python tools/label.py recordings/kitchen_test_20261018_101500
+    .venv/bin/python tools/label.py recordings/kitchen_20261018_101500
     .venv/bin/python tools/label.py                 # opens the newest episode
 
 Controls
@@ -9,8 +10,8 @@ Controls
     j l          1 s back / forward                (also down / up arrow = 10 s)
     J L          10 s back / forward
     - =          slower / faster playback (0.25x ... 8x)
-    [            mark anomaly START at the current frame
-    ]            mark anomaly END here -> adds the interval
+    [            mark event START at the current frame
+    ]            mark event END here -> adds the interval
     x            delete the interval under the playhead
     n p          jump to the next / previous interval
     click, drag  on the timeline to seek
@@ -32,7 +33,7 @@ from eye.episode import chunk_paths, frame_index, load_labels, load_meta, save_l
 VIEW = (960, 540)
 TIMELINE_H = 64
 HELP_H = 26
-WIN = "label anomalies"
+WIN = "label events"
 RED, ORANGE, WHITE, DIM, BG = (40, 40, 230), (40, 160, 255), (235, 235, 235), (140, 140, 140), (28, 28, 28)
 SPEEDS = [0.25, 0.5, 1, 2, 4, 8]
 
@@ -142,11 +143,11 @@ class Labeler:
                 self.seek(prv[-1])
 
     def save(self):
-        self.intervals = save_labels(self.ep, self.intervals, self.seqs, source="offline")
+        self.intervals = save_labels(self.ep, self.intervals, self.seqs)
         self.dirty = False
-        n_anom = sum(b - a + 1 for a, b in self.intervals)
-        print(f"saved {len(self.intervals)} intervals, {n_anom} anomalous frames "
-              f"({n_anom / self.fps:.1f} s) -> {self.ep / 'labels.json'}")
+        n_event = sum(b - a + 1 for a, b in self.intervals)
+        print(f"saved {len(self.intervals)} intervals, {n_event} event frames "
+              f"({n_event / self.fps:.1f} s) -> {self.ep / 'labels.json'}")
 
     # ---- drawing ------------------------------------------------------------------------
     def frame_img(self):
@@ -163,7 +164,7 @@ class Labeler:
         view = self.frame_img()
         if self.interval_at(self.idx) is not None:
             cv2.rectangle(view, (0, 0), (VIEW[0] - 1, VIEW[1] - 1), RED, 10)
-            text(view, "ANOMALY", (VIEW[0] - 150, 34), RED, 0.8, 2)
+            text(view, "EVENT", (VIEW[0] - 120, 34), RED, 0.8, 2)
         if self.pending is not None:
             text(view, f"start marked at {fmt(self.t[self.pending])} - press ] to end, [ to move it",
                  (12, VIEW[1] - 16), ORANGE, 0.55)
@@ -243,7 +244,6 @@ class Labeler:
         cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback(WIN, self.on_mouse)
         print(f"{self.ep.name}: {self.n} frames ({self.t[-1]:.0f} s), "
-              f"{self.meta.get('scene', '?')}/{self.meta.get('split', '?')}, "
               f"{len(self.intervals)} existing intervals")
         while True:
             cv2.imshow(WIN, self.render())

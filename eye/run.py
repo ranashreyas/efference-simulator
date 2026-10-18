@@ -5,7 +5,7 @@
     python -m eye.run --actuator virtual --babble --log   # ...and record an episode
 
 Recording household video: run tools/record.py on the Mac, which starts this with --log and
-pulls the episode to the Mac afterwards. Label it there with tools/label.py.
+copies the episode to the Mac afterwards.
 """
 import argparse
 import collections
@@ -18,7 +18,7 @@ from .actuators import NullActuator, SaccadeBabbler, ServoModel, VirtualActuator
 from .camera import Camera
 from .logger import EpisodeLogger
 from .preprocess import MODEL_SIZE, to_gray_small
-from .stream import ControlReceiver, DebugPublisher
+from .stream import DebugPublisher
 
 STREAM_FULL_SIZE = (640, 360)
 
@@ -38,10 +38,8 @@ def main():
     ap.add_argument("--actuator", choices=["null", "virtual"], default="null")
     ap.add_argument("--babble", action="store_true", help="random saccades (virtual actuator)")
     ap.add_argument("--log", action="store_true", help="record an episode to recordings/")
-    ap.add_argument("--scene", default="room", help="scene name stored with the episode")
-    ap.add_argument("--split", choices=["train", "test"], default="train",
-                    help="train = normal activity only; test = contains labeled anomalies")
-    ap.add_argument("--port", type=int, default=5555, help="debug stream; labels arrive on port + 1")
+    ap.add_argument("--scene", default="home", help="free-form name stored with the episode")
+    ap.add_argument("--port", type=int, default=5555, help="debug stream port")
     ap.add_argument("--no-calibrate", action="store_true")
     ap.add_argument("--target-brightness", type=float, default=100)
     ap.add_argument("--servo-latency", type=float, default=0.06)
@@ -57,16 +55,14 @@ def main():
     if babbler and args.actuator == "null":
         print("[run] --babble does nothing with the null actuator")
     pub = DebugPublisher(args.port)
-    control = ControlReceiver(args.port + 1)
     logger = None
     if args.log:
-        meta = dict(scene=args.scene, split=args.split,
-                    actuator=args.actuator, device=cam.device, controls=cam.controls,
-                    camera_size=[cam.width, cam.height], fps=cam.fps,
+        meta = dict(scene=args.scene, actuator=args.actuator, device=cam.device,
+                    controls=cam.controls, camera_size=[cam.width, cam.height], fps=cam.fps,
                     crop_size=[act.crop_w, act.crop_h], focal_px=act.f,
                     servo=dict(latency=act.servo.latency, max_speed=act.servo.max_speed,
                                backlash=act.servo.backlash, noise=act.servo.noise))
-        name = f"{args.scene}_{args.split}_{time.strftime('%Y%m%d_%H%M%S')}"
+        name = f"{args.scene}_{time.strftime('%Y%m%d_%H%M%S')}"
         logger = EpisodeLogger(name=name, meta=meta, fps=cam.fps)
         print(f"[run] recording to {logger.dir} (Ctrl-C to stop)")
     print(f"[run] actuator={args.actuator} eye range ±{act.pan_limit:.1f}° pan, "
@@ -97,11 +93,6 @@ def main():
                     if logger:
                         logger.add_command(cmd)
 
-            for msg in control.poll():
-                if msg.get("type") == "label" and logger:
-                    logger.add_label(msg)
-                    print(f"[run] anomaly {msg['state']} at frame {msg['seq']}")
-
             state = act.state(frame.t_sensor)              # where the eye was when this frame was taken
             eye = act.view(frame, state)
             model_in = to_gray_small(eye.img, MODEL_SIZE)
@@ -120,9 +111,7 @@ def main():
                           exposure=cam.controls.get("exposure_time_absolute"),
                           gain=cam.controls.get("gain"),
                           logging=logger.dir if logger else None,
-                          scene=args.scene, split=args.split,
-                          label_active=logger.label_active if logger else False,
-                          label_count=logger.label_count if logger else 0)
+                          scene=args.scene)
             pub.send(header, {
                 "full": cv2.resize(frame.img, STREAM_FULL_SIZE, interpolation=cv2.INTER_AREA),
                 "eye": eye.img,
@@ -134,7 +123,6 @@ def main():
         if logger:
             logger.close()
         pub.close()
-        control.close()
         cam.stop()
         print(f"[run] stopped; {dropped} frames dropped by the loop")
 
