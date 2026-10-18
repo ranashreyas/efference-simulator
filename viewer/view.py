@@ -7,7 +7,10 @@
 Layout:
     [ full camera frame + eye window ] [ what the eye sees ] [ stats + motor trace ]
     [ model input (128x96)           ] [ prediction        ] [ surprise            ]
-Keys: q quit, s save a snapshot.
+Keys:
+    SPACE  start / end an anomaly interval (only while the Pi runs with --log)
+    s      save a snapshot
+    q      quit
 """
 import argparse
 import collections
@@ -19,7 +22,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from eye.stream import DebugSubscriber  # noqa: E402
+from eye.stream import ControlSender, DebugSubscriber  # noqa: E402
 
 PANE = (480, 360)
 FULL = (640, 360)
@@ -72,7 +75,8 @@ def draw_info(header, trace, recv_fps):
         f"exposure   {(header['exposure'] or 0) / 10:.1f} ms  gain {header['gain']}",
         f"pan  {s['pan']:+6.2f}  (target {s['pan_target']:+6.2f})",
         f"tilt {s['tilt']:+6.2f}  (target {s['tilt_target']:+6.2f})",
-        "logging    " + ("yes" if header["logging"] else "no"),
+        (f"recording  {header.get('scene')}/{header.get('split')}, "
+         f"{header.get('label_count', 0)} labels") if header["logging"] else "recording  no (--log)",
     ]
     for i, text in enumerate(lines):
         label(out, text, (10, 24 + i * 22), FG, 0.45)
@@ -111,7 +115,19 @@ def compose(header, images, trace, recv_fps):
         pane(images.get("surprise"), PANE, "surprise", cv2.INTER_NEAREST) if "surprise" in images
         else placeholder(PANE, "surprise", "phase 1b: precision-weighted error"),
     ])
-    return np.vstack([top, bottom])
+    canvas = np.vstack([top, bottom])
+    if header.get("label_active"):
+        h, w = canvas.shape[:2]
+        cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (0, 0, 255), 10)
+        cv2.rectangle(canvas, (w // 2 - 230, 8), (w // 2 + 230, 44), (0, 0, 200), -1)
+        label(canvas, "ANOMALY  -  press SPACE to end", (w // 2 - 210, 34), (255, 255, 255), 0.7)
+    return canvas
+
+
+def flash(canvas, text):
+    h, w = canvas.shape[:2]
+    cv2.rectangle(canvas, (w // 2 - 330, h // 2 - 30), (w // 2 + 330, h // 2 + 20), (40, 40, 40), -1)
+    label(canvas, text, (w // 2 - 310, h // 2), (80, 200, 255), 0.6)
 
 
 def main():
@@ -123,6 +139,8 @@ def main():
     args = ap.parse_args()
 
     sub = DebugSubscriber(args.host, args.port)
+    control = ControlSender(args.host, args.port + 1)
+    flash_text, flash_until = None, 0.0
     trace = collections.deque(maxlen=200)
     arrivals = collections.deque(maxlen=30)
     received, last_seq, skipped = 0, None, 0
@@ -154,10 +172,22 @@ def main():
             continue
 
         canvas = compose(header, images, trace, recv_fps)
+        if flash_text and time.monotonic() < flash_until:
+            flash(canvas, flash_text)
         cv2.imshow("efference eye", canvas)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord(" "):
+            if header.get("logging"):
+                # Toggle based on what the Pi reports, so the viewer never drifts out of sync.
+                state = "end" if header.get("label_active") else "start"
+                control.send(dict(type="label", state=state, seq=header["seq"],
+                                  t_sensor=header["t_sensor"]))
+                print(f"anomaly {state} at frame {header['seq']}")
+            else:
+                flash_text = "Not recording: start the Pi with --log to label anomalies"
+                flash_until = time.monotonic() + 2.5
         if key == ord("s"):
             path = time.strftime("snapshot_%H%M%S.png")
             cv2.imwrite(path, canvas)
