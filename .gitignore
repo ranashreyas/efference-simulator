@@ -4,3 +4,5 @@ __pycache__/
 snapshot_*.png
 .DS_Store
 recordings/
+data/
+.venv-train/

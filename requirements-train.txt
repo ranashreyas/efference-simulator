@@ -1,0 +1,6 @@
+# Mac side: model training (Intel Mac: torch 2.2.2 is the last build, needs Python <= 3.12)
+# python3.11 -m venv .venv-train && .venv-train/bin/pip install -r requirements-train.txt
+torch==2.2.2
+numpy<2
+opencv-python<4.11
+onnx

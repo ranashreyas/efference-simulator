@@ -78,6 +78,7 @@ class ChunkFrames:
 
 
 def fmt(t):
+    t = round(float(t), 1)
     return f"{int(t // 60):02d}:{t % 60:04.1f}"
 
 
