@@ -4,9 +4,8 @@
     python -m eye.run --actuator virtual --babble  # virtual eye making random saccades
     python -m eye.run --actuator virtual --babble --log   # ...and record an episode
 
-Recording a dataset (same convention as ShanghaiTech / NWPU Campus):
-    python -m eye.run --log --scene bedroom --split train   # normal activity only
-    python -m eye.run --log --scene bedroom --split test    # mark anomalies with SPACE in the viewer
+Recording household video: run tools/record.py on the Mac, which starts this with --log and
+pulls the episode to the Mac afterwards. Label it there with tools/label.py.
 """
 import argparse
 import collections
@@ -38,7 +37,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--actuator", choices=["null", "virtual"], default="null")
     ap.add_argument("--babble", action="store_true", help="random saccades (virtual actuator)")
-    ap.add_argument("--log", action="store_true", help="record an episode to runs/")
+    ap.add_argument("--log", action="store_true", help="record an episode to recordings/")
     ap.add_argument("--scene", default="room", help="scene name stored with the episode")
     ap.add_argument("--split", choices=["train", "test"], default="train",
                     help="train = normal activity only; test = contains labeled anomalies")
@@ -68,7 +67,8 @@ def main():
                     servo=dict(latency=act.servo.latency, max_speed=act.servo.max_speed,
                                backlash=act.servo.backlash, noise=act.servo.noise))
         name = f"{args.scene}_{args.split}_{time.strftime('%Y%m%d_%H%M%S')}"
-        logger = EpisodeLogger(name=name, meta=meta)
+        logger = EpisodeLogger(name=name, meta=meta, fps=cam.fps)
+        print(f"[run] recording to {logger.dir} (Ctrl-C to stop)")
     print(f"[run] actuator={args.actuator} eye range ±{act.pan_limit:.1f}° pan, "
           f"±{act.tilt_limit:.1f}° tilt; streaming on tcp://*:{args.port}")
 

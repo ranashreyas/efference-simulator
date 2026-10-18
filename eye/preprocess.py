@@ -2,6 +2,7 @@ import cv2
 
 MODEL_SIZE = (128, 96)      # (width, height) the forward model sees
 LOG_SIZE = (320, 180)       # full frame, stored wide enough to cut virtual saccades offline
+PREVIEW_SIZE = (640, 360)   # color video for a human to watch while labeling
 
 
 def to_gray_small(img, size):

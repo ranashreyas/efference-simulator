@@ -3,3 +3,4 @@ runs/
 __pycache__/
 snapshot_*.png
 .DS_Store
+recordings/
