@@ -8,10 +8,13 @@ Layout:
     [ actual: what the model sees ] [ model surprise ] [ frame difference ]
     [ stats | score traces over the last 10 s (and pan angle for the panning eye)   ]
     [ "show top X% of pixels" slider                                               ]
+    [ [x] remove specks of <= N pixels   N slider (1-10)                            ]
 The slider filters what both heatmaps show: each pane keeps only its own strongest X% of pixels,
 so surprise and frame difference get the same pixel budget whatever their units. Display only:
 the model and the scores are unchanged. Drag it, or use - and = to step it.
-Keys: - = slider, s save a snapshot, q quit
+With the checkbox on, any connected cluster of N or fewer pixels that survives the slider is
+removed from both heatmaps (isolated specks of noise); with it off, the check doesn't run.
+Keys: - = slider, c speck removal on/off, , . change N, s save a snapshot, q quit
 """
 import argparse
 import collections
@@ -111,6 +114,64 @@ class SensitivitySlider:
         return out
 
 
+class SpeckFilter:
+    """Display-only: when enabled, removes connected clusters (8-connected) of at most `size`
+    pixels from a filtered heatmap. Runs after the top-X% slider, on both heatmaps."""
+
+    def __init__(self, enabled=False, size=3):
+        self.enabled, self.size = enabled, size
+        self.top = PANE[1] + BAR_H + SLIDER_H                 # where this control row starts
+        self.box = (14, 12, 34, 32)                            # checkbox, canvas pixels
+        self.x0, self.x1 = 330, 560                            # N slider track
+
+    def apply(self, img):
+        """Returns the image with small clusters removed, and (removed, total) cluster counts."""
+        if not self.enabled:
+            return img, None
+        n, labels, stats, _ = cv2.connectedComponentsWithStats((img > 0).astype(np.uint8), connectivity=8)
+        areas = stats[1:, cv2.CC_STAT_AREA]                    # label 0 is the background
+        small = np.flatnonzero(areas <= self.size) + 1
+        out = img.copy()
+        out[np.isin(labels, small)] = 0
+        return out, (len(small), n - 1)
+
+    def nudge(self, step):
+        self.size = int(np.clip(self.size + step, 1, 10))
+
+    def on_mouse(self, event, x, y, flags, _):
+        if not self.top <= y < self.top + SLIDER_H:
+            return
+        bx0, by0, bx1, by1 = self.box
+        if event == cv2.EVENT_LBUTTONDOWN and bx0 - 4 <= x <= 300 and by0 - 4 <= y - self.top <= by1 + 4:
+            self.enabled = not self.enabled                    # click the box or its label
+            return
+        dragging = event == cv2.EVENT_MOUSEMOVE and flags & cv2.EVENT_FLAG_LBUTTON
+        if (event == cv2.EVENT_LBUTTONDOWN or dragging) and self.x0 - 10 <= x <= self.x1 + 10:
+            self.size = int(round(1 + np.clip((x - self.x0) / (self.x1 - self.x0), 0, 1) * 9))
+
+    def draw(self, counts_s, counts_d):
+        out = np.full((SLIDER_H, PANE[0] * 3, 3), (30, 30, 30), np.uint8)
+        mid = SLIDER_H // 2
+        bx0, by0, bx1, by1 = self.box
+        cv2.rectangle(out, (bx0, by0), (bx1, by1), FG, 1)
+        if self.enabled:
+            cv2.line(out, (bx0 + 4, mid), (bx0 + 9, by1 - 5), SURPRISE_COLOR, 2, cv2.LINE_AA)
+            cv2.line(out, (bx0 + 9, by1 - 5), (bx1 - 3, by0 + 4), SURPRISE_COLOR, 2, cv2.LINE_AA)
+        color = FG if self.enabled else DIM
+        label(out, f"remove specks of <= {self.size} px", (bx1 + 12, mid + 5), color, 0.5)
+        cv2.line(out, (self.x0, mid), (self.x1, mid), (90, 90, 90), 4, cv2.LINE_AA)
+        x = int(self.x0 + (self.size - 1) / 9 * (self.x1 - self.x0))
+        cv2.line(out, (self.x0, mid), (x, mid), SURPRISE_COLOR if self.enabled else DIM, 4, cv2.LINE_AA)
+        cv2.circle(out, (x, mid), 8, SURPRISE_COLOR if self.enabled else DIM, -1, cv2.LINE_AA)
+        if self.enabled and counts_s and counts_d:
+            text = (f"removed {counts_s[0]} of {counts_s[1]} clusters (surprise), "
+                    f"{counts_d[0]} of {counts_d[1]} (diff)")
+        else:
+            text = "off: no cluster check" if not self.enabled else ""
+        label(out, text, (self.x1 + 30, mid + 5), color, 0.45)
+        return out
+
+
 def heat_pane(img, title):
     if img is None:
         out = np.full((PANE[1], PANE[0], 3), BG, np.uint8)
@@ -163,17 +224,22 @@ def bar(header, trace, recv_fps):
     return out
 
 
-def compose(header, images, trace, recv_fps, slider=None):
+def compose(header, images, trace, recv_fps, slider=None, specks=None):
     slider = slider or SensitivitySlider()
+    specks = specks or SpeckFilter()
     surprise, diff, cut_s, cut_d = images.get("surprise"), images.get("diff"), 0.0, 0.0
+    counts_s = counts_d = None
     if surprise is not None:
         surprise, cut_s = slider.apply(surprise, header.get("surprise_vmax", SURPRISE_VMAX))
+        surprise, counts_s = specks.apply(surprise)
     if diff is not None:
         diff, cut_d = slider.apply(diff, header.get("diff_vmax", DIFF_VMAX))
+        diff, counts_d = specks.apply(diff)
     row = np.hstack([actual_pane(images, header),
                      heat_pane(surprise, "model surprise"),
                      heat_pane(diff, "frame difference (1/15 s)")])
-    return np.vstack([row, bar(header, trace, recv_fps), slider.draw(cut_s, cut_d)])
+    return np.vstack([row, bar(header, trace, recv_fps), slider.draw(cut_s, cut_d),
+                      specks.draw(counts_s, counts_d)])
 
 
 def main():
@@ -190,6 +256,7 @@ def main():
     received, last_seq, skipped = 0, None, 0
     window = None
     slider = SensitivitySlider()
+    specks = SpeckFilter()
     print(f"connecting to tcp://{args.host}:{args.port} ...")
 
     while not args.count or received < args.count:
@@ -219,8 +286,8 @@ def main():
         if window is None:
             window = f"efference eye - {header['mode']} (port {args.port})"
             cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            cv2.setMouseCallback(window, slider.on_mouse)
-        canvas = compose(header, images, trace, recv_fps, slider)
+            cv2.setMouseCallback(window, lambda *a: (slider.on_mouse(*a), specks.on_mouse(*a)))
+        canvas = compose(header, images, trace, recv_fps, slider, specks)
         cv2.imshow(window, canvas)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -229,6 +296,12 @@ def main():
             slider.nudge(-5)
         if key in (ord("="), ord("+")):
             slider.nudge(5)
+        if key == ord("c"):
+            specks.enabled = not specks.enabled
+        if key == ord(","):
+            specks.nudge(-1)
+        if key == ord("."):
+            specks.nudge(1)
         if key == ord("s"):
             path = time.strftime("snapshot_%H%M%S.png")
             cv2.imwrite(path, canvas)
