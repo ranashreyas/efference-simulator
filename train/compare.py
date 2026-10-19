@@ -1,13 +1,12 @@
-"""Before/after comparison on a moving eye: run models over the held-out footage with the
-virtual eye following one fixed path, and compare their surprise. Run on the Mac.
+"""Moving-eye check: run models over the held-out footage with the virtual eye following one
+fixed path, and compare their surprise. Run on the Mac.
 
-    .venv-train/bin/python -m train.compare --models kitchen_v1 kitchen_v2 --motion sweep --video
-    .venv-train/bin/python -m train.compare --models kitchen_v1 kitchen_v2 --motion random
+    .venv-train/bin/python -m train.compare --models kitchen_v2 --motion sweep --video
+    .venv-train/bin/python -m train.compare --models kitchen_v2 kitchen_v3 --motion random
 
-For each model (and the newest one again with its motor input blanked) reports the mean
-surprise score while the eye is moving, while it's paused, and around turnarounds (when it
-starts, stops or reverses). Models whose motor input is 32 wide (trained before the current
-encoding) get zeros, as in their training.
+Each model runs twice: with its motor input, and with it blanked (to see what the efference
+copy contributes). Reports the mean surprise score while the eye is moving, while it's paused,
+and around turnarounds (when it starts, stops or reverses), next to frame difference.
 
 Writes data/compare/<motion>/: timeline.png, metrics.txt, and with --video compare.mp4
 (the eye's view, each model's surprise, and frame difference side by side).
@@ -20,7 +19,7 @@ import numpy as np
 import torch
 
 from eye.episode import frame_index
-from eye.motor import ACTION_DIM, ACTUAL_NOISE_DEG, STEPS, blank, encode_rows
+from eye.motor import ACTUAL_NOISE_DEG, STEPS, blank, encode_rows
 from train.evaluate import top_mean
 from train.model import N_FRAMES, load_model, surprise_map
 from train.video import open_writer
@@ -54,10 +53,7 @@ def main():
     centers, mot30 = simulate_track(times30, seed=args.seed, motion=args.motion)
 
     models = {name: load_model(PROJECT / "data" / "models" / name / "model.pt") for name in args.models}
-    newest = args.models[-1]
-    runs = [(name, False) for name in args.models]
-    if models[newest].action_dim == ACTION_DIM:
-        runs.append((newest, True))                              # newest model, motor blanked
+    runs = [(name, blind) for name in args.models for blind in (False, True)]
     label = {(n, b): n + (" (motor blanked)" if b else "") for n, b in runs}
 
     rng = np.random.default_rng(0)
@@ -80,9 +76,8 @@ def main():
             inp, y = x[:, :N_FRAMES], x[:, N_FRAMES:]
             maps = {}
             for name, blind in runs:
-                m = models[name]
-                mot = (blank(len(p)) if blind else motor) if m.action_dim == ACTION_DIM else np.zeros((len(p), m.action_dim), np.float32)
-                pred, logvar, _ = m(inp, torch.from_numpy(mot))
+                mot = blank(len(p)) if blind else motor
+                pred, logvar, _ = models[name](inp, torch.from_numpy(mot))
                 s_map = surprise_map(y, pred, logvar)
                 scores[(name, blind)].append(top_mean(s_map).numpy())
                 maps[(name, blind)] = s_map[:, 0].numpy()

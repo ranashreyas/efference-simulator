@@ -1,8 +1,8 @@
 """Main loop on the Pi: camera -> one or more eye pipelines -> forward model -> stream (+ log).
 
     python -m eye.run                                         # static eye, stream only
-    python -m eye.run --model models/kitchen_v1.onnx          # ... with live surprise
-    python -m eye.run --actuator null virtual --motion sweep --model models/kitchen_v1.onnx
+    python -m eye.run --model models/kitchen_v2.onnx          # ... with live surprise
+    python -m eye.run --actuator null virtual --motion sweep --model models/kitchen_v2.onnx
                      # two pipelines from one camera: static on port 5555, panning on 5556
 
 Each pipeline has its own actuator and its own copy of the model, and publishes on its own port
@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from .actuators import (NullActuator, RemoteControl, SaccadeBabbler, ServoModel, SweepScan,
+from .actuators import (NullActuator, RandomPan, RemoteControl, ServoModel, SweepScan,
                         VirtualActuator)
 from .camera import Camera
 from .logger import EpisodeLogger
@@ -52,8 +52,8 @@ class Pipeline:
         self.motion = None
         if kind == "virtual" and args.motion == "sweep":
             self.motion = SweepScan(self.act.pan_limit, sweep_s=args.sweep_seconds)
-        elif kind == "virtual" and args.motion == "babble":
-            self.motion = SaccadeBabbler(self.act.pan_limit, self.act.tilt_limit)
+        elif kind == "virtual" and args.motion == "random":
+            self.motion = RandomPan(self.act.pan_limit, self.act.tilt_limit)
         # remote control from the viewer (arrow keys); while on, it overrides --motion
         self.remote = RemoteControl(self.act.pan_limit, self.act.tilt_limit, speed=args.remote_speed)
         self.remote_on = False
@@ -65,7 +65,6 @@ class Pipeline:
                                           actual_noise_deg=ACTUAL_NOISE_DEG if kind == "virtual" else 0.0)
         self.pub = DebugPublisher(port)
         self.port = port
-        self.scores = None
 
     def model_input(self, frame, eye):
         if self.kind == "null":
@@ -121,11 +120,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--actuator", nargs="+", choices=["null", "virtual"], default=["null"],
                     help="one pipeline per actuator, published on --port, --port + 1, ...")
-    ap.add_argument("--motion", choices=["none", "sweep", "babble"], default="none",
+    ap.add_argument("--motion", choices=["none", "sweep", "random"], default="none",
                     help="virtual eye movement: sweep = left->right, 1 s pause, right->left, "
-                         "1 s pause, repeat; babble = random saccades")
+                         "1 s pause, repeat; random = slow wandering pans, like the training data")
     ap.add_argument("--sweep-seconds", type=float, default=10.0, help="duration of each pan of the sweep")
-    ap.add_argument("--model", help="ONNX forward model (e.g. models/kitchen_v1.onnx)")
+    ap.add_argument("--model", help="ONNX forward model (e.g. models/kitchen_v2.onnx)")
     ap.add_argument("--model-threads", type=int, default=2, help="per pipeline; pipelines run in parallel")
     ap.add_argument("--crop", type=int, nargs=2, default=[552, 414], metavar=("W", "H"),
                     help="virtual eye crop size in camera pixels (default: 1/4 of the frame, 4:3)")

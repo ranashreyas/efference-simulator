@@ -35,10 +35,6 @@ class LiveForwardModel:
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads
         self.session = ort.InferenceSession(str(onnx_path), so, providers=["CPUExecutionProvider"])
-        # models trained before the current motor encoding take a 32-wide input and never used it:
-        # give those zeros, exactly as in their training
-        self.motor_dim = self.session.get_inputs()[1].shape[1]
-        self.uses_motor = self.motor_dim == motor.ACTION_DIM
         self.step_s = step_s
         self.history = collections.deque(maxlen=24)    # (t, model input), ~0.8 s at 30 fps
         self.states = collections.deque(maxlen=motor.STEPS)
@@ -66,8 +62,7 @@ class LiveForwardModel:
         frames = np.stack(past)[None].astype(np.float32) / 255
         target = model_input.astype(np.float32) / 255
         t0 = time.perf_counter()
-        m = (motor.encode(self.states, self.actual_noise_deg, self.rng) if self.uses_motor
-             else np.zeros(self.motor_dim, np.float32))
+        m = motor.encode(self.states, self.actual_noise_deg, self.rng)
         pred, logvar = self.session.run(None, {"frames": frames, "motor": m[None]})
         infer_ms = (time.perf_counter() - t0) * 1000
         pred, logvar = pred[0, 0], logvar[0, 0]

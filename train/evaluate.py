@@ -1,8 +1,9 @@
-"""Run a trained model over the held-out part of each episode and compare its surprise score
-with a frame-differencing baseline. Run on the Mac.
+"""Static-eye check: run a trained model over the held-out part of each episode, as the fixed
+camera sees it, and compare its surprise score with a frame-differencing baseline. Scores
+labeled events if there are any. Run on the Mac. (For the moving eye, see train/compare.py.)
 
-    .venv-train/bin/python -m train.evaluate --model kitchen_v1            # scores + timeline
-    .venv-train/bin/python -m train.evaluate --model kitchen_v1 --video    # + side-by-side video
+    .venv-train/bin/python -m train.evaluate --model kitchen_v2            # scores + timeline
+    .venv-train/bin/python -m train.evaluate --model kitchen_v2 --video    # + side-by-side video
 
 Per frame, three event scores (each = mean of the top 1% of a blurred per-pixel map, then
 smoothed over ~0.3 s):
@@ -24,7 +25,8 @@ import cv2
 import numpy as np
 import torch
 
-from train.model import N_FRAMES, ForwardModel, surprise_map
+from eye.motor import still
+from train.model import N_FRAMES, load_model, surprise_map
 from train.video import open_writer
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -86,7 +88,7 @@ def run_episode(model, name, out, fps, make_video, batch=64):
         p = pos[k:k + batch]
         x = torch.from_numpy(np.stack([frames[i - N_FRAMES:i + 1] for i in p]).astype(np.float32) / 255)
         inp, y = x[:, :N_FRAMES], x[:, N_FRAMES:]
-        pred, logvar, _ = model(inp)
+        pred, logvar, _ = model(inp, torch.from_numpy(still(len(p))))     # what the static eye sends
         s_map = surprise_map(y, pred, logvar)
         e_map = (y - pred) ** 2
         d_map = (y - inp[:, -1:]) ** 2
@@ -165,9 +167,7 @@ def main():
 
     mdir = MODELS / args.model
     config = json.loads((mdir / "config.json").read_text())
-    model = ForwardModel()
-    model.load_state_dict(torch.load(mdir / "model.pt"))
-    model.eval()
+    model = load_model(mdir / "model.pt")
     for name in config["episodes"]:
         out = mdir / "eval" / name
         out.mkdir(parents=True, exist_ok=True)

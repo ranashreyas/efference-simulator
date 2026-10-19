@@ -3,4 +3,3 @@ numpy
 opencv-python-headless
 onnxruntime
 pyzmq
-linuxpy

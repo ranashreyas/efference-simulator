@@ -51,6 +51,12 @@ Mark events that happened naturally: a person entering the frame, fast motion. S
 
 ## How the data is used
 
+Recordings are always made with the camera still. Training (`train/train.py`) uses each one two
+ways: as the fixed camera sees it, and through a **simulated panning eye** that wanders over the
+same footage on a new random path every round (`train/virtual.py`), so one still recording gives
+unlimited moving-camera data.
+
 The model trains on **all** recorded video except the last 15% of each recording, which is held
 out automatically (`holdout_split` in `eye/episode.py`). Event labels inside that held-out part
-are used to score whether surprise spikes on real events. Labels never affect training.
+are used to score whether surprise spikes on real events (`train/evaluate.py`). Labels never
+affect training, so label the last 15% of a recording if you want a detection score.

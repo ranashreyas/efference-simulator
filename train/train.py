@@ -1,7 +1,7 @@
 """Train the forward model on prepared episodes. Run on the Mac.
 
-    .venv-train/bin/python -m train.train --name kitchen_v1 --static-frac 1.0      # still camera only
-    .venv-train/bin/python -m train.train --name kitchen_v2 --init kitchen_v1      # + virtual pans
+    .venv-train/bin/python -m train.train --name kitchen_v2                        # from scratch
+    .venv-train/bin/python -m train.train --name kitchen_v3 --init kitchen_v2      # continue from a model
 
 Learns to predict frame t from frames 1/15, 2/15, 3/15 s earlier plus the motor history (no
 labels involved). Each batch mixes two kinds of samples:
@@ -28,7 +28,7 @@ import torch
 from eye.episode import frame_index
 from eye.motor import ACTUAL_NOISE_DEG, PAN_INDEX, STEPS, encode_rows, still
 from train.evaluate import top_mean
-from train.model import ACTION_DIM, N_FRAMES, ForwardModel, surprise_map
+from train.model import N_FRAMES, ForwardModel, surprise_map
 from train.virtual import crop_input, simulate_track
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -178,7 +178,8 @@ def main():
     ap.add_argument("--steps", type=int, default=400, help="training steps per round")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--static-frac", type=float, default=0.25, help="share of still-camera samples")
+    ap.add_argument("--static-frac", type=float, default=0.25,
+                    help="share of still-camera samples (they keep the static eye accurate)")
     ap.add_argument("--motor-dropout", type=float, default=0.2, help="share of virtual samples with motor blanked")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
@@ -207,7 +208,8 @@ def main():
         print(f"initialized from {args.init}" + (f"; new (not copied): {skipped}" if skipped else ""))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     total = args.rounds * args.steps
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=total, pct_start=0.05)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=total,
+                                                pct_start=max(0.05, 3 / total))   # >= 3 warm-up steps
 
     base = evaluate(model, data)
     print(f"before training: {describe(base)}", flush=True)

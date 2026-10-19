@@ -14,7 +14,6 @@ Frames are subsampled by --stride (default 2: 30 fps -> 15 fps) so each predicti
 more motion. Episodes without meta.json (interrupted or partly deleted) are skipped.
 """
 import argparse
-import os
 import sys
 from pathlib import Path
 

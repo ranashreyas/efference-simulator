@@ -7,15 +7,18 @@ it is talking to:
     state(t)               -> MotorState: best estimate of where the eye actually is at time t
     view(frame, state)     -> the image the eye sees, given the camera frame and eye state
 
-NullActuator     never moves (phase 1: static camera)
+NullActuator     never moves (the static eye)
 VirtualActuator  a crop window that slides around the full camera frame, driven by a
-                 simulated servo with latency, speed limit, backlash and noise (phase 2)
-ServoActuator    real pan-tilt servos (phase 3, not written yet)
+                 simulated servo with latency, speed limit, backlash and noise (the panning eye)
+
+Motion patterns that drive a VirtualActuator (each returns a pan/tilt target per frame):
+SweepScan        slow left-right sweep with pauses (the live demo)
+RandomPan        slow wandering pans in random directions (training data, and live)
+RemoteControl    arrow keys from the viewer
 """
 import bisect
 import collections
 import math
-import random
 import time
 
 import cv2
@@ -132,43 +135,6 @@ class NullActuator(VirtualActuator):
     def state(self, t=None):
         t = time.monotonic() if t is None else t
         return MotorState(t, 0.0, 0.0, 0.0, 0.0)
-
-
-class ServoActuator:
-    """Real pan-tilt servos driven over PCA9685 / hardware PWM. Written in phase 3."""
-
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("ServoActuator arrives with the servos (phase 3)")
-
-
-class SaccadeBabbler:
-    """Random eye movements for collecting self-supervised training data ("motor babbling").
-    Mostly big jumps, sometimes small corrective ones, with random pauses between them."""
-
-    def __init__(self, pan_limit, tilt_limit, pause=(0.3, 1.2), small_prob=0.3, seed=None):
-        self.pan_limit, self.tilt_limit = pan_limit, tilt_limit
-        self.pause = pause
-        self.small_prob = small_prob
-        self._rng = random.Random(seed)
-        self._next_t = None
-        self._pan = self._tilt = 0.0
-
-    def step(self, t):
-        """Return a new (pan, tilt) target when it's time to move, otherwise None."""
-        if self._next_t is None:
-            self._next_t = t + self._rng.uniform(*self.pause)
-        if t < self._next_t:
-            return None
-        self._next_t = t + self._rng.uniform(*self.pause)
-        if self._rng.random() < self.small_prob:
-            self._pan += self._rng.gauss(0, 1.5)
-            self._tilt += self._rng.gauss(0, 1.0)
-        else:
-            self._pan = self._rng.uniform(-0.9, 0.9) * self.pan_limit
-            self._tilt = self._rng.uniform(-0.9, 0.9) * self.tilt_limit
-        self._pan = max(-self.pan_limit, min(self.pan_limit, self._pan))
-        self._tilt = max(-self.tilt_limit, min(self.tilt_limit, self._tilt))
-        return self._pan, self._tilt
 
 
 class SweepScan:

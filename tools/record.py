@@ -10,11 +10,9 @@ stop; the Pi finishes writing the episode, then every episode not yet on the Mac
 into recordings/ here. Labeling events with tools/label.py is optional.
 """
 import argparse
-import os
 import shlex
 import subprocess
 import sys
-
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent

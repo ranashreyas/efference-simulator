@@ -85,14 +85,13 @@ def warp(img, flow):
 
 
 class ForwardModel(nn.Module):
-    def __init__(self, widths=(16, 32, 64, 96), emb=64, action_dim=ACTION_DIM):
+    def __init__(self, widths=(16, 32, 64, 96), emb=64):
         super().__init__()
-        self.action_dim = action_dim
         w1, w2, w3, w4 = widths
         self.enc1, self.enc2 = Down(N_FRAMES, w1), Down(w1, w2)     # 48x64, 24x32
         self.enc3, self.enc4 = Down(w2, w3), Down(w3, w4)           # 12x16, 6x8
         self.mid = ResBlock(w4)
-        self.motor = nn.Sequential(nn.Linear(action_dim, emb), nn.ReLU(inplace=True),
+        self.motor = nn.Sequential(nn.Linear(ACTION_DIM, emb), nn.ReLU(inplace=True),
                                    nn.Linear(emb, emb), nn.ReLU(inplace=True))
         self.film3, self.film4 = FiLM(emb, w3), FiLM(emb, w4)
         self.up3 = Up(w4, w3, w3)                                   # 12x16
@@ -110,7 +109,7 @@ class ForwardModel(nn.Module):
 
     def forward(self, frames, motor=None):
         if motor is None:
-            motor = frames.new_zeros(frames.shape[0], self.action_dim)
+            motor = frames.new_zeros(frames.shape[0], ACTION_DIM)
         e = self.motor(motor)
         s1 = self.enc1(frames)
         s2 = self.enc2(s1)
@@ -129,11 +128,9 @@ class ForwardModel(nn.Module):
 
 
 def load_model(path):
-    """A trained model from its state dict, with the motor input size it was trained with
-    (older models used a 32-wide motor input)."""
-    state = torch.load(path)
-    model = ForwardModel(action_dim=state["motor.0.weight"].shape[1])
-    model.load_state_dict(state)
+    """A trained model, ready for inference."""
+    model = ForwardModel()
+    model.load_state_dict(torch.load(path))
     return model.eval()
 
 
