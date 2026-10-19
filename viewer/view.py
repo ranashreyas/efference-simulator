@@ -7,10 +7,11 @@
 Layout:
     [ actual: what the model sees ] [ model surprise ] [ frame difference ]
     [ stats | score traces over the last 10 s (and pan angle for the panning eye)   ]
-    [ surprise sensitivity slider                                                   ]
-The slider only filters what the surprise pane shows (surprise below its threshold is hidden);
+    [ "show top X% of pixels" slider                                               ]
+The slider filters what both heatmaps show: each pane keeps only its own strongest X% of pixels,
+so surprise and frame difference get the same pixel budget whatever their units. Display only:
 the model and the scores are unchanged. Drag it, or use - and = to step it.
-Keys: - = sensitivity, s save a snapshot, q quit
+Keys: - = slider, s save a snapshot, q quit
 """
 import argparse
 import collections
@@ -27,7 +28,8 @@ from eye.stream import DebugSubscriber  # noqa: E402
 PANE = (480, 360)
 BAR_H = 130
 SLIDER_H = 44
-SURPRISE_VMAX = 50.0              # fallback; the Pi sends the scale it used in the header
+SURPRISE_VMAX = 50.0              # fallbacks; the Pi sends the scales it used in the header
+DIFF_VMAX = 0.25
 BG = (24, 24, 24)
 FG = (230, 230, 230)
 DIM = (130, 130, 130)
@@ -60,22 +62,31 @@ def actual_pane(images, header):
 
 
 class SensitivitySlider:
-    """Display-only filter for the surprise pane. 100 = show all surprise; lower values hide
-    weaker surprise, on a log scale down to 0 = only the strongest (at the color scale's top)."""
+    """Display-only filter for both heatmaps: each keeps only its own strongest X% of pixels.
+    Position 100 = show all; lower positions show fewer, on a log scale down to 0 = top 0.1%.
+    Note a top-X% filter always shows *something*: on a quiet frame the strongest 1% is just the
+    strongest noise."""
 
     def __init__(self, value=100):
         self.value = value
-        self.x0, self.x1 = 250, PANE[0] * 3 - 330         # slider track, in canvas pixels
+        self.x0, self.x1 = 250, PANE[0] * 3 - 400         # slider track, in canvas pixels
         self.top = PANE[1] + BAR_H                          # where the slider row starts
 
-    def threshold(self, vmax):
-        return 0.0 if self.value >= 100 else vmax * 10 ** (-4 * self.value / 100)
+    def fraction(self):
+        return 10 ** (-3 * (1 - self.value / 100))          # 100 -> 100%, 67 -> 10%, 33 -> 1%, 0 -> 0.1%
 
     def apply(self, img, vmax):
-        """img: surprise sent as 255 * sqrt(value / vmax). Hide pixels below the threshold."""
-        cut = 255 * np.sqrt(self.threshold(vmax) / vmax)
-        keep = img >= cut
-        return np.where(keep, img, 0).astype(np.uint8), float(keep.mean())
+        """img: a map sent as 255 * sqrt(value / vmax) (monotonic, so ranking pixels by it is
+        ranking them by value). Keeps the strongest fraction(); returns the filtered image and
+        the cutoff in the map's own units."""
+        f = self.fraction()
+        if f >= 1:
+            return img, 0.0
+        flat = img.ravel()
+        k = max(1, int(round(len(flat) * f)))
+        cut = int(np.partition(flat, -k)[-k])
+        out = np.where(img >= max(cut, 1), img, 0).astype(np.uint8)    # never "keep" pure zeros
+        return out, (cut / 255) ** 2 * vmax
 
     def nudge(self, step):
         self.value = int(np.clip(self.value + step, 0, 100))
@@ -85,17 +96,17 @@ class SensitivitySlider:
         if self.top <= y < self.top + SLIDER_H and (event == cv2.EVENT_LBUTTONDOWN or dragging):
             self.value = int(round(np.clip((x - self.x0) / (self.x1 - self.x0), 0, 1) * 100))
 
-    def draw(self, vmax, shown):
+    def draw(self, cut_surprise, cut_diff):
         out = np.full((SLIDER_H, PANE[0] * 3, 3), (30, 30, 30), np.uint8)
         mid = SLIDER_H // 2
-        label(out, "surprise sensitivity", (10, mid + 5), FG, 0.5)
+        label(out, "show top % of pixels", (10, mid + 5), FG, 0.5)
         cv2.line(out, (self.x0, mid), (self.x1, mid), (90, 90, 90), 4, cv2.LINE_AA)
         x = int(self.x0 + self.value / 100 * (self.x1 - self.x0))
         cv2.line(out, (self.x0, mid), (x, mid), SURPRISE_COLOR, 4, cv2.LINE_AA)
         cv2.circle(out, (x, mid), 9, SURPRISE_COLOR, -1, cv2.LINE_AA)
-        thr = self.threshold(vmax)
-        text = (f"{self.value:3d}  showing all" if thr == 0 else
-                f"{self.value:3d}  showing surprise > {thr:.3g}  ({shown:.1%} of pixels)")
+        f = self.fraction()
+        text = ("showing all pixels" if f >= 1 else
+                f"top {100 * f:.2g}% per pane (surprise >= {cut_surprise:.3g}, diff >= {cut_diff:.2g})")
         label(out, text, (self.x1 + 20, mid + 5), FG, 0.45)
         return out
 
@@ -154,14 +165,15 @@ def bar(header, trace, recv_fps):
 
 def compose(header, images, trace, recv_fps, slider=None):
     slider = slider or SensitivitySlider()
-    vmax = header.get("surprise_vmax", SURPRISE_VMAX)
-    surprise, shown = images.get("surprise"), 1.0
+    surprise, diff, cut_s, cut_d = images.get("surprise"), images.get("diff"), 0.0, 0.0
     if surprise is not None:
-        surprise, shown = slider.apply(surprise, vmax)
+        surprise, cut_s = slider.apply(surprise, header.get("surprise_vmax", SURPRISE_VMAX))
+    if diff is not None:
+        diff, cut_d = slider.apply(diff, header.get("diff_vmax", DIFF_VMAX))
     row = np.hstack([actual_pane(images, header),
                      heat_pane(surprise, "model surprise"),
-                     heat_pane(images.get("diff"), "frame difference (1/15 s)")])
-    return np.vstack([row, bar(header, trace, recv_fps), slider.draw(vmax, shown)])
+                     heat_pane(diff, "frame difference (1/15 s)")])
+    return np.vstack([row, bar(header, trace, recv_fps), slider.draw(cut_s, cut_d)])
 
 
 def main():
