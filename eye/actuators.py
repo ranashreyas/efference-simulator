@@ -12,6 +12,7 @@ VirtualActuator  a crop window that slides around the full camera frame, driven 
                  simulated servo with latency, speed limit, backlash and noise (phase 2)
 ServoActuator    real pan-tilt servos (phase 3, not written yet)
 """
+import bisect
 import collections
 import math
 import random
@@ -82,7 +83,8 @@ class VirtualActuator:
         self.servo = servo or ServoModel()
         self.pan_limit = math.degrees(math.atan((self.full_w - self.crop_w) / 2 / self.f))
         self.tilt_limit = math.degrees(math.atan((self.full_h - self.crop_h) / 2 / self.f))
-        self.commands = []              # every command ever sent, for logging
+        self.commands = []              # every command ever sent, for logging and the efference copy
+        self._cmd_times = []
 
     def command(self, pan, tilt, t=None):
         t = time.monotonic() if t is None else t
@@ -91,14 +93,19 @@ class VirtualActuator:
         cmd = MotorCmd(t, pan, tilt)
         self.servo.command(cmd)
         self.commands.append(cmd)
+        self._cmd_times.append(t)
         return cmd
 
     def state(self, t=None):
+        """Actual angle from the servo model; commanded angle = the most recent command *sent*
+        by time t (not the delayed copy the servo is acting on), so it leads the motion."""
         t = time.monotonic() if t is None else t
-        (pan, tilt), (pt, tt) = self.servo.step(t)
+        (pan, tilt), _ = self.servo.step(t)
         pan = float(np.clip(pan, -self.pan_limit, self.pan_limit))
         tilt = float(np.clip(tilt, -self.tilt_limit, self.tilt_limit))
-        return MotorState(t, pan, tilt, float(pt), float(tt))
+        k = bisect.bisect_right(self._cmd_times, t) - 1
+        pt, tt = (self.commands[k].pan, self.commands[k].tilt) if k >= 0 else (0.0, 0.0)
+        return MotorState(t, pan, tilt, pt, tt)
 
     def crop_center(self, state):
         cx = self.full_w / 2 + self.f * math.tan(math.radians(state.pan))
@@ -162,3 +169,77 @@ class SaccadeBabbler:
         self._pan = max(-self.pan_limit, min(self.pan_limit, self._pan))
         self._tilt = max(-self.tilt_limit, min(self.tilt_limit, self._tilt))
         return self._pan, self._tilt
+
+
+class SweepScan:
+    """Back-and-forth horizontal pan: left to right over `sweep_s`, pause `pause_s`, right to
+    left over `sweep_s`, pause `pause_s`, repeat. Tilt stays level. A new target is commanded
+    every frame, so the (simulated) servo follows a smooth constant-speed path."""
+
+    def __init__(self, pan_limit, sweep_s=10.0, pause_s=1.0, margin=0.95):
+        self.amp = pan_limit * margin
+        self.sweep_s, self.pause_s = sweep_s, pause_s
+        self._t0 = None
+
+    def step(self, t):
+        if self._t0 is None:
+            self._t0 = t
+        period = 2 * (self.sweep_s + self.pause_s)
+        ph = (t - self._t0) % period
+        if ph < self.sweep_s:                                   # left -> right
+            pan = -self.amp + 2 * self.amp * ph / self.sweep_s
+        elif ph < self.sweep_s + self.pause_s:                  # pause at the right
+            pan = self.amp
+        elif ph < 2 * self.sweep_s + self.pause_s:              # right -> left
+            pan = self.amp - 2 * self.amp * (ph - self.sweep_s - self.pause_s) / self.sweep_s
+        else:                                                   # pause at the left
+            pan = -self.amp
+        return pan, 0.0
+
+
+class RandomPan:
+    """Slow, smooth, wandering pans for training data. Every 3-9 s (or on reaching the edge of
+    the range) the eye picks a new random direction (pan and tilt) and a new speed around the
+    10 s sweep's ~4 deg/s. Velocity eases toward each new heading and speed, and the heading
+    drifts a little within a segment, so paths curve and speeds vary. Returns a target every
+    frame; the servo model adds latency, speed limit, backlash and jitter on top."""
+
+    def __init__(self, pan_limit, tilt_limit, segment_s=(3.0, 9.0), speed=(2.5, 6.5),
+                 ease_s=(0.4, 1.5), drift_deg_s=15.0, margin=0.95, seed=None):
+        self.lim = np.array([pan_limit, tilt_limit]) * margin
+        self.segment_s, self.speed, self.ease_s, self.drift = segment_s, speed, ease_s, drift_deg_s
+        self.rng = np.random.default_rng(seed)
+        self.pos = np.zeros(2)
+        self.vel = np.zeros(2)
+        self._t = None
+
+    def _new_segment(self, t, inward=None):
+        heading = self.rng.uniform(0, 2 * np.pi)
+        if inward is not None:                                  # bounced: head back into range
+            d = np.array([np.cos(heading), np.sin(heading)])
+            d[inward != 0] = -np.sign(inward[inward != 0]) * np.abs(d[inward != 0])
+            heading = np.arctan2(d[1], d[0])
+        self.heading = heading
+        self.target_speed = self.rng.uniform(*self.speed)
+        self.ease = self.rng.uniform(*self.ease_s)
+        self.seg_end = t + self.rng.uniform(*self.segment_s)
+
+    def step(self, t):
+        if self._t is None:
+            self._t = t
+            self._new_segment(t)
+        dt = max(0.0, t - self._t)
+        self._t = t
+        if t >= self.seg_end:
+            self._new_segment(t)
+        self.heading += np.radians(self.rng.normal(0, self.drift)) * np.sqrt(dt)   # gentle curving
+        want = self.target_speed * np.array([np.cos(self.heading), np.sin(self.heading)])
+        self.vel += (want - self.vel) * (1 - np.exp(-dt / self.ease))             # smooth speed/turns
+        nxt = self.pos + self.vel * dt
+        hit = np.where(nxt > self.lim, 1, np.where(nxt < -self.lim, -1, 0))
+        if hit.any():                                           # edge: clamp and pick a new direction
+            nxt = np.clip(nxt, -self.lim, self.lim)
+            self.vel[hit != 0] = 0
+            self._new_segment(t, inward=hit)
+        self.pos = nxt
+        return float(self.pos[0]), float(self.pos[1])

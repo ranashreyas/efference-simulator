@@ -1,15 +1,16 @@
-"""Live debug viewer (runs on the Mac). Subscribes to the Pi's debug stream.
+"""Live viewer (runs on the Mac). Subscribes to one of the Pi's eye pipelines.
 
-    .venv/bin/python -m viewer.view                    # connects to raspberrypi.local:5555
-    .venv/bin/python -m viewer.view --host 192.168.12.104
+    .venv/bin/python -m viewer.view                 # first pipeline (port 5555)
+    .venv/bin/python -m viewer.view --port 5556     # second pipeline (e.g. the panning eye)
     .venv/bin/python -m viewer.view --headless --count 90   # no window; print stats and exit
 
 Layout:
-    [ full camera frame + eye window ] [ what the eye sees ] [ stats + motor trace ]
-    [ model input (128x96)           ] [ prediction        ] [ surprise            ]
-Keys:
-    s      save a snapshot
-    q      quit
+    [ actual: what the model sees ] [ model surprise ] [ frame difference ]
+    [ stats | score traces over the last 10 s (and pan angle for the panning eye)   ]
+    [ surprise sensitivity slider                                                   ]
+The slider only filters what the surprise pane shows (surprise below its threshold is hidden);
+the model and the scores are unchanged. Drag it, or use - and = to step it.
+Keys: - = sensitivity, s save a snapshot, q quit
 """
 import argparse
 import collections
@@ -24,96 +25,143 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from eye.stream import DebugSubscriber  # noqa: E402
 
 PANE = (480, 360)
-FULL = (640, 360)
-INFO = (320, 360)
+BAR_H = 130
+SLIDER_H = 44
+SURPRISE_VMAX = 50.0              # fallback; the Pi sends the scale it used in the header
 BG = (24, 24, 24)
 FG = (230, 230, 230)
 DIM = (130, 130, 130)
-TARGET_COLOR = (80, 170, 255)   # orange (BGR)
-ACTUAL_COLOR = (255, 200, 80)   # light blue (BGR)
+SURPRISE_COLOR = (80, 200, 255)   # orange (BGR)
+DIFF_COLOR = (170, 170, 170)
+PAN_COLOR = (255, 200, 80)        # light blue
+TRACE_S = 10.0
 
 
 def label(img, text, org=(10, 24), color=FG, scale=0.55):
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
+    """Text on a dark box, readable over any image."""
+    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    x, y = org
+    cv2.rectangle(img, (x - 4, y - h - 4), (x + w + 4, y + base + 2), (16, 16, 16), -1)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
-def pane(img, size, title, interp=cv2.INTER_AREA):
-    out = np.full((size[1], size[0], 3), BG, np.uint8)
-    if img is not None:
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        out = cv2.resize(img, size, interpolation=interp)
+def actual_pane(images, header):
+    out = cv2.resize(images["eye"], PANE, interpolation=cv2.INTER_AREA)
+    if "full" in images:                                # panning: where in the room the eye points
+        tw, th = 176, 99
+        thumb = cv2.resize(images["full"], (tw, th), interpolation=cv2.INTER_AREA)
+        fw, fh = header["full_size"]
+        x, y, w, h = header["crop_rect"]
+        cv2.rectangle(thumb, (int(x * tw / fw), int(y * th / fh)),
+                      (int((x + w) * tw / fw), int((y + h) * th / fh)), (0, 255, 0), 1)
+        out[PANE[1] - th - 8:PANE[1] - 8, PANE[0] - tw - 8:PANE[0] - 8] = thumb
+    label(out, "actual (what the model sees)")
+    return out
+
+
+class SensitivitySlider:
+    """Display-only filter for the surprise pane. 100 = show all surprise; lower values hide
+    weaker surprise, on a log scale down to 0 = only the strongest (at the color scale's top)."""
+
+    def __init__(self, value=100):
+        self.value = value
+        self.x0, self.x1 = 250, PANE[0] * 3 - 330         # slider track, in canvas pixels
+        self.top = PANE[1] + BAR_H                          # where the slider row starts
+
+    def threshold(self, vmax):
+        return 0.0 if self.value >= 100 else vmax * 10 ** (-4 * self.value / 100)
+
+    def apply(self, img, vmax):
+        """img: surprise sent as 255 * sqrt(value / vmax). Hide pixels below the threshold."""
+        cut = 255 * np.sqrt(self.threshold(vmax) / vmax)
+        keep = img >= cut
+        return np.where(keep, img, 0).astype(np.uint8), float(keep.mean())
+
+    def nudge(self, step):
+        self.value = int(np.clip(self.value + step, 0, 100))
+
+    def on_mouse(self, event, x, y, flags, _):
+        dragging = event == cv2.EVENT_MOUSEMOVE and flags & cv2.EVENT_FLAG_LBUTTON
+        if self.top <= y < self.top + SLIDER_H and (event == cv2.EVENT_LBUTTONDOWN or dragging):
+            self.value = int(round(np.clip((x - self.x0) / (self.x1 - self.x0), 0, 1) * 100))
+
+    def draw(self, vmax, shown):
+        out = np.full((SLIDER_H, PANE[0] * 3, 3), (30, 30, 30), np.uint8)
+        mid = SLIDER_H // 2
+        label(out, "surprise sensitivity", (10, mid + 5), FG, 0.5)
+        cv2.line(out, (self.x0, mid), (self.x1, mid), (90, 90, 90), 4, cv2.LINE_AA)
+        x = int(self.x0 + self.value / 100 * (self.x1 - self.x0))
+        cv2.line(out, (self.x0, mid), (x, mid), SURPRISE_COLOR, 4, cv2.LINE_AA)
+        cv2.circle(out, (x, mid), 9, SURPRISE_COLOR, -1, cv2.LINE_AA)
+        thr = self.threshold(vmax)
+        text = (f"{self.value:3d}  showing all" if thr == 0 else
+                f"{self.value:3d}  showing surprise > {thr:.3g}  ({shown:.1%} of pixels)")
+        label(out, text, (self.x1 + 20, mid + 5), FG, 0.45)
+        return out
+
+
+def heat_pane(img, title):
+    if img is None:
+        out = np.full((PANE[1], PANE[0], 3), BG, np.uint8)
+        label(out, "warming up (needs 7 frames)" if title else "", (10, PANE[1] // 2), DIM, 0.5)
+    else:
+        out = cv2.applyColorMap(cv2.resize(img, PANE, interpolation=cv2.INTER_NEAREST),
+                                cv2.COLORMAP_INFERNO)
     label(out, title)
     return out
 
 
-def placeholder(size, title, note):
-    out = pane(None, size, title)
-    label(out, note, (10, size[1] // 2), DIM, 0.5)
-    return out
-
-
-def draw_full(img, header):
-    out = pane(img, FULL, "camera (full frame)")
-    fw, fh = header["full_size"]
-    x, y, w, h = header["crop_rect"]
-    sx, sy = FULL[0] / fw, FULL[1] / fh
-    cv2.rectangle(out, (int(x * sx), int(y * sy)), (int((x + w) * sx), int((y + h) * sy)), (0, 255, 0), 2)
-    return out
-
-
-def draw_info(header, trace, recv_fps):
-    out = np.full((INFO[1], INFO[0], 3), BG, np.uint8)
+def bar(header, trace, recv_fps):
+    out = np.full((BAR_H, PANE[0] * 3, 3), BG, np.uint8)
     s = header["state"]
-    lines = [
-        f"actuator   {header['actuator']}",
-        f"camera     {header['fps']:.1f} fps   viewer {recv_fps:.1f} fps",
-        f"proc       {header['proc_ms']:.1f} ms   dropped {header['dropped']}",
-        f"capture->proc {header['capture_to_proc_ms']:.1f} ms",
-        f"exposure   {(header['exposure'] or 0) / 10:.1f} ms  gain {header['gain']}",
-        f"pan  {s['pan']:+6.2f}  (target {s['pan_target']:+6.2f})",
-        f"tilt {s['tilt']:+6.2f}  (target {s['tilt_target']:+6.2f})",
-        f"recording  {header.get('scene')}" if header["logging"] else "recording  no (--log)",
-    ]
+    lines = [f"{header['mode']} eye   camera {header['fps']:.1f} fps   viewer {recv_fps:.1f} fps",
+             f"model {header.get('infer_ms', '-')} ms   loop {header['proc_ms']} ms   "
+             f"dropped {header['dropped']}   skipped {header.get('skipped', 0)}",
+             f"surprise {header.get('surprise_score', 0):.3g}   frame diff {header.get('diff_score', 0):.3g}"]
+    if header["mode"] == "panning":
+        lines.append(f"pan {s['pan']:+5.1f} (cmd {s['pan_target']:+5.1f})  "
+                     f"tilt {s['tilt']:+5.1f} (cmd {s['tilt_target']:+5.1f})")
     for i, text in enumerate(lines):
-        label(out, text, (10, 24 + i * 22), FG, 0.45)
+        label(out, text, (10, 24 + i * 24), FG, 0.45)
 
-    # Motor trace: pan target vs actual over the last few seconds.
-    top, bottom, left, right = 210, 345, 10, INFO[0] - 10
+    left, right, top, bottom = 480, PANE[0] * 3 - 10, 10, BAR_H - 10
     cv2.rectangle(out, (left, top), (right, bottom), (60, 60, 60), 1)
-    label(out, "pan: target vs actual (4 s)", (left + 4, top + 16), DIM, 0.4)
-    if len(trace) > 1:
-        t_end = trace[-1][0]
-        span = max(5.0, max(abs(v) for _, a, b in trace for v in (a, b)) * 1.1)
+    if len(trace) < 2:
+        return out
+    t_end = trace[-1][0]
+    pts = [p for p in trace if t_end - p[0] <= TRACE_S]
+    x = np.array([right - (t_end - p[0]) / TRACE_S * (right - left) for p in pts], np.int32)
 
-        def pt(t, v):
-            x = right - (t_end - t) / 4.0 * (right - left)
-            y = (top + bottom) / 2 - v / span * (bottom - top) / 2
-            return int(x), int(y)
+    def draw(values, color, lo, hi, thick=1):
+        v = np.clip((np.asarray(values, float) - lo) / max(hi - lo, 1e-12), 0, 1)
+        y = (bottom - 4 - v * (bottom - top - 8)).astype(np.int32)
+        cv2.polylines(out, [np.stack([x, y], 1)], False, color, thick, cv2.LINE_AA)
 
-        for (t0, tgt0, act0), (t1, tgt1, act1) in zip(trace, list(trace)[1:]):
-            if t_end - t0 > 4.0:
-                continue
-            cv2.line(out, pt(t0, tgt0), pt(t1, tgt1), TARGET_COLOR, 1, cv2.LINE_AA)
-            cv2.line(out, pt(t0, act0), pt(t1, act1), ACTUAL_COLOR, 2, cv2.LINE_AA)
+    sur = np.sqrt([p[1] for p in pts])                  # sqrt: spikes visible without flattening the rest
+    dif = np.sqrt([p[2] for p in pts])
+    draw(dif, DIFF_COLOR, 0, max(dif.max(), 1e-6))
+    draw(sur, SURPRISE_COLOR, 0, max(sur.max(), 1e-6), 2)
+    names = [("surprise", SURPRISE_COLOR), ("frame diff", DIFF_COLOR)]
+    if header["mode"] == "panning":
+        lim = header["pan_limit"] or 1
+        draw([p[3] for p in pts], PAN_COLOR, -lim, lim)
+        names.append(("pan angle", PAN_COLOR))
+    for i, (n, c) in enumerate(names):
+        label(out, n, (left + 8 + i * 110, top + 16), c, 0.42)
+    label(out, f"last {TRACE_S:.0f} s (each trace auto-scaled)", (right - 230, top + 16), DIM, 0.4)
     return out
 
 
-def compose(header, images, trace, recv_fps):
-    top = np.hstack([draw_full(images.get("full"), header),
-                     pane(images.get("eye"), PANE, "eye view"),
-                     draw_info(header, trace, recv_fps)])
-    model = images.get("model")
-    bottom = np.hstack([
-        pane(model, PANE, f"model input {model.shape[1]}x{model.shape[0]}" if model is not None
-             else "model input", interp=cv2.INTER_NEAREST),
-        pane(images.get("prediction"), PANE, "prediction", cv2.INTER_NEAREST) if "prediction" in images
-        else placeholder(PANE, "prediction", "phase 1b: forward model"),
-        pane(images.get("surprise"), PANE, "surprise", cv2.INTER_NEAREST) if "surprise" in images
-        else placeholder(PANE, "surprise", "phase 1b: precision-weighted error"),
-    ])
-    return np.vstack([top, bottom])
+def compose(header, images, trace, recv_fps, slider=None):
+    slider = slider or SensitivitySlider()
+    vmax = header.get("surprise_vmax", SURPRISE_VMAX)
+    surprise, shown = images.get("surprise"), 1.0
+    if surprise is not None:
+        surprise, shown = slider.apply(surprise, vmax)
+    row = np.hstack([actual_pane(images, header),
+                     heat_pane(surprise, "model surprise"),
+                     heat_pane(images.get("diff"), "frame difference (1/15 s)")])
+    return np.vstack([row, bar(header, trace, recv_fps), slider.draw(vmax, shown)])
 
 
 def main():
@@ -125,12 +173,12 @@ def main():
     args = ap.parse_args()
 
     sub = DebugSubscriber(args.host, args.port)
-    trace = collections.deque(maxlen=200)
+    trace = collections.deque(maxlen=600)
     arrivals = collections.deque(maxlen=30)
     received, last_seq, skipped = 0, None, 0
+    window = None
+    slider = SensitivitySlider()
     print(f"connecting to tcp://{args.host}:{args.port} ...")
-    if not args.headless:
-        cv2.namedWindow("efference eye", cv2.WINDOW_NORMAL)
 
     while not args.count or received < args.count:
         msg = sub.recv_latest(timeout_ms=1000)
@@ -144,22 +192,31 @@ def main():
         last_seq = header["seq"]
         arrivals.append(time.monotonic())
         recv_fps = (len(arrivals) - 1) / (arrivals[-1] - arrivals[0]) if len(arrivals) > 1 else 0.0
-        s = header["state"]
-        trace.append((header["t_sensor"], s["pan_target"], s["pan"]))
+        trace.append((header["t_sensor"], header.get("surprise_score", 0.0),
+                      header.get("diff_score", 0.0), header["state"]["pan"]))
 
         if args.headless:
             if received % 30 == 0 or received == 1:
-                shapes = {k: v.shape for k, v in images.items()}
-                print(f"msg {received}: seq {header['seq']} camera {header['fps']} fps, "
-                      f"viewer {recv_fps:.1f} fps, proc {header['proc_ms']} ms, "
-                      f"pan {s['pan']:+.2f}/{s['pan_target']:+.2f}, images {shapes}")
+                print(f"msg {received}: {header['mode']} seq {header['seq']} camera {header['fps']} fps, "
+                      f"viewer {recv_fps:.1f} fps, model {header.get('infer_ms', '-')} ms, "
+                      f"loop {header['proc_ms']} ms, surprise {header.get('surprise_score', 0):.3g}, "
+                      f"diff {header.get('diff_score', 0):.3g}, pan {header['state']['pan']:+.1f}, "
+                      f"images {sorted(images)}")
             continue
 
-        canvas = compose(header, images, trace, recv_fps)
-        cv2.imshow("efference eye", canvas)
+        if window is None:
+            window = f"efference eye - {header['mode']} (port {args.port})"
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            cv2.setMouseCallback(window, slider.on_mouse)
+        canvas = compose(header, images, trace, recv_fps, slider)
+        cv2.imshow(window, canvas)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord("-"):
+            slider.nudge(-5)
+        if key in (ord("="), ord("+")):
+            slider.nudge(5)
         if key == ord("s"):
             path = time.strftime("snapshot_%H%M%S.png")
             cv2.imwrite(path, canvas)

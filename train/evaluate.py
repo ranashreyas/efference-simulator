@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from train.model import N_FRAMES, ForwardModel, surprise_map
+from train.video import open_writer
 
 PROJECT = Path(__file__).resolve().parent.parent
 CACHE = PROJECT / "data" / "cache"
@@ -79,7 +80,7 @@ def run_episode(model, name, out, fps, make_video, batch=64):
     scores = {m: [] for m in METHODS}
     writer = None
     if make_video:
-        writer = cv2.VideoWriter(str(out / "eval.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (768, 640))
+        writer = open_writer(out / "eval.mp4", fps, (768, 640))
     vmax_s = vmax_d = None
     for k in range(0, len(pos), batch):
         p = pos[k:k + batch]

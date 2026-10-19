@@ -28,5 +28,6 @@ class MotorState:
     t: float            # time this state estimate refers to
     pan: float          # best estimate of actual angle, degrees
     tilt: float
-    pan_target: float   # last commanded target the actuator is chasing
+    pan_target: float   # most recent command sent as of t (the efference copy: it leads the
+                        # actual angle by the servo's reaction delay)
     tilt_target: float

@@ -2,7 +2,7 @@
 
     frames (B, 3, 96, 128) in [0, 1] ─┐
                                       ├─► encoder ─► bottleneck ─► decoder ─► 3 heads
-    motor history (B, 32) ─► MLP ─► FiLM (scale/shift of encoder features at 12x16 and 6x8)
+    motor history (B, 35) ─► MLP ─► FiLM (scale/shift of encoder features at 12x16 and 6x8)
 
     heads   flow      (B, 2, H, W)  pixels each pixel moved since the last frame
             residual  (B, 1, H, W)  change that motion can't explain
@@ -13,14 +13,14 @@
 Flow and residual heads start at zero, so an untrained model predicts "next frame = last frame".
 With a fixed camera the motor history is all zeros; the input is wired for the moving eye.
 """
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-N_FRAMES = 3
-ACTION_DIM = 32          # 8 time steps x (commanded pan, tilt, estimated pan, tilt)
+from eye import motor
+from eye.forward import LOGVAR_FLOOR, N_FRAMES
+
+ACTION_DIM = motor.ACTION_DIM   # encoded motor history (see eye/motor.py)
 
 
 def conv(cin, cout, stride=1):
@@ -85,13 +85,14 @@ def warp(img, flow):
 
 
 class ForwardModel(nn.Module):
-    def __init__(self, widths=(16, 32, 64, 96), emb=64):
+    def __init__(self, widths=(16, 32, 64, 96), emb=64, action_dim=ACTION_DIM):
         super().__init__()
+        self.action_dim = action_dim
         w1, w2, w3, w4 = widths
         self.enc1, self.enc2 = Down(N_FRAMES, w1), Down(w1, w2)     # 48x64, 24x32
         self.enc3, self.enc4 = Down(w2, w3), Down(w3, w4)           # 12x16, 6x8
         self.mid = ResBlock(w4)
-        self.motor = nn.Sequential(nn.Linear(ACTION_DIM, emb), nn.ReLU(inplace=True),
+        self.motor = nn.Sequential(nn.Linear(action_dim, emb), nn.ReLU(inplace=True),
                                    nn.Linear(emb, emb), nn.ReLU(inplace=True))
         self.film3, self.film4 = FiLM(emb, w3), FiLM(emb, w4)
         self.up3 = Up(w4, w3, w3)                                   # 12x16
@@ -109,7 +110,7 @@ class ForwardModel(nn.Module):
 
     def forward(self, frames, motor=None):
         if motor is None:
-            motor = frames.new_zeros(frames.shape[0], ACTION_DIM)
+            motor = frames.new_zeros(frames.shape[0], self.action_dim)
         e = self.motor(motor)
         s1 = self.enc1(frames)
         s2 = self.enc2(s1)
@@ -127,9 +128,13 @@ class ForwardModel(nn.Module):
         return pred, logvar, flow
 
 
-# Expected error is never allowed below ~2 gray levels of camera noise. Without this floor the
-# model claims sub-noise precision on still background and its surprise map fills with speckle.
-LOGVAR_FLOOR = math.log((2 / 255) ** 2)
+def load_model(path):
+    """A trained model from its state dict, with the motor input size it was trained with
+    (older models used a 32-wide motor input)."""
+    state = torch.load(path)
+    model = ForwardModel(action_dim=state["motor.0.weight"].shape[1])
+    model.load_state_dict(state)
+    return model.eval()
 
 
 def surprise_map(target, pred, logvar):
