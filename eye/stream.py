@@ -4,6 +4,9 @@ drops old frames instead of falling behind.
 
 Wire format (multipart): [b"dbg", header_json, image_0, image_1, ...]
 header["images"] lists the image names in order.
+
+A second, separate channel runs the other way (viewer -> Pi, one control port shared by all
+pipelines) for remote control. It uses PUSH/PULL so no message is dropped.
 """
 import json
 
@@ -68,3 +71,41 @@ class DebugSubscriber:
             images[name] = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_UNCHANGED)
         return header, images
 
+
+
+class ControlReceiver:
+    """Pi side: collects control messages sent by viewers. Never blocks."""
+
+    def __init__(self, port=5560):
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.PULL)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.bind(f"tcp://*:{port}")
+
+    def poll(self):
+        msgs = []
+        while True:
+            try:
+                msgs.append(json.loads(self.sock.recv(flags=zmq.NOBLOCK)))
+            except zmq.Again:
+                return msgs
+
+    def close(self):
+        self.sock.close()
+
+
+class ControlSender:
+    """Viewer side: sends control messages to the Pi."""
+
+    def __init__(self, host="raspberrypi.local", port=5560):
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.PUSH)
+        self.sock.setsockopt(zmq.LINGER, 500)
+        self.sock.setsockopt(zmq.SNDHWM, 50)
+        self.sock.connect(f"tcp://{host}:{port}")
+
+    def send(self, msg):
+        try:
+            self.sock.send(json.dumps(msg).encode(), flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass                                            # Pi not reachable: drop, don't freeze the viewer

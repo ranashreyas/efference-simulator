@@ -243,3 +243,36 @@ class RandomPan:
             self._new_segment(t, inward=hit)
         self.pos = nxt
         return float(self.pos[0]), float(self.pos[1])
+
+
+class RemoteControl:
+    """Arrow-key driving from the viewer. Each key event moves the target at `speed` deg/s in
+    that direction for `hold_s`; holding a key auto-repeats the event (after the OS's initial
+    repeat delay, which `hold_s` bridges), so the eye keeps moving smoothly until it's released.
+    One direction at a time: the latest key wins."""
+
+    def __init__(self, pan_limit, tilt_limit, speed=6.0, hold_s=0.3, margin=0.95):
+        self.lim = np.array([pan_limit, tilt_limit]) * margin
+        self.speed, self.hold_s = speed, hold_s
+        self.reset(0.0, 0.0)
+
+    def reset(self, pan, tilt):
+        """Start from the given angles (where the eye already is), not moving."""
+        self.pos = np.clip([pan, tilt], -self.lim, self.lim).astype(float)
+        self.dir = np.zeros(2)
+        self.until = -np.inf
+        self._t = None
+
+    def key(self, dx, dy, t):
+        """dx: +1 right / -1 left, dy: +1 up / -1 down."""
+        self.dir = np.array([dx, dy], float)
+        self.until = t + self.hold_s
+
+    def step(self, t):
+        if self._t is None:
+            self._t = t
+        dt = max(0.0, t - self._t)
+        self._t = t
+        if t < self.until:
+            self.pos = np.clip(self.pos + self.dir * self.speed * dt, -self.lim, self.lim)
+        return float(self.pos[0]), float(self.pos[1])

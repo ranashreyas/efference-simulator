@@ -23,11 +23,12 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from .actuators import NullActuator, SaccadeBabbler, ServoModel, SweepScan, VirtualActuator
+from .actuators import (NullActuator, RemoteControl, SaccadeBabbler, ServoModel, SweepScan,
+                        VirtualActuator)
 from .camera import Camera
 from .logger import EpisodeLogger
 from .preprocess import LOG_SIZE, MODEL_SIZE, static_model_input, to_gray_small
-from .stream import DebugPublisher
+from .stream import ControlReceiver, DebugPublisher
 
 STREAM_EYE_SIZE = (320, 240)
 STREAM_THUMB_SIZE = (320, 180)
@@ -53,6 +54,9 @@ class Pipeline:
             self.motion = SweepScan(self.act.pan_limit, sweep_s=args.sweep_seconds)
         elif kind == "virtual" and args.motion == "babble":
             self.motion = SaccadeBabbler(self.act.pan_limit, self.act.tilt_limit)
+        # remote control from the viewer (arrow keys); while on, it overrides --motion
+        self.remote = RemoteControl(self.act.pan_limit, self.act.tilt_limit, speed=args.remote_speed)
+        self.remote_on = False
         self.model = None
         if model_path:
             from .forward import LiveForwardModel
@@ -68,10 +72,25 @@ class Pipeline:
             return static_model_input(to_gray_small(frame.img, LOG_SIZE))   # identical to training
         return to_gray_small(eye.img, MODEL_SIZE)                           # the crop, nothing else
 
+    def control(self, msg, t_now):
+        """A message from the viewer: {"type": "remote", "enabled": bool} or
+        {"type": "key", "dx": -1|0|1, "dy": -1|0|1}. Only the virtual eye can be driven."""
+        if self.kind != "virtual":
+            return
+        if msg.get("type") == "remote" and bool(msg.get("enabled")) != self.remote_on:
+            self.remote_on = bool(msg.get("enabled"))
+            if self.remote_on:                          # take over from wherever the eye points now
+                s = self.act.state(t_now)
+                self.remote.reset(s.pan_target, s.tilt_target)
+            print(f"[run] remote control {'on' if self.remote_on else 'off'}")
+        elif msg.get("type") == "key" and self.remote_on:
+            self.remote.key(msg.get("dx", 0), msg.get("dy", 0), t_now)
+
     def step(self, frame, t_now):
         cmd = None
-        if self.motion:
-            target = self.motion.step(t_now)
+        mover = self.remote if self.remote_on else self.motion
+        if mover:
+            target = mover.step(t_now)
             if target:
                 cmd = self.act.command(*target, t=t_now)
         state = self.act.state(frame.t_sensor)          # where the eye was when this frame was taken
@@ -82,7 +101,8 @@ class Pipeline:
     def publish(self, frame, state, eye, out, header):
         header = dict(header, mode="static" if self.kind == "null" else "panning",
                       state=dataclasses.asdict(state), crop_rect=self.act.crop_rect(state),
-                      pan_limit=self.act.pan_limit, tilt_limit=self.act.tilt_limit)
+                      pan_limit=self.act.pan_limit, tilt_limit=self.act.tilt_limit,
+                      remote=self.remote_on, remote_available=self.kind == "virtual")
         images = {"eye": cv2.resize(eye.img, STREAM_EYE_SIZE, interpolation=cv2.INTER_AREA)}
         if self.kind == "virtual":
             images["full"] = cv2.resize(frame.img, STREAM_THUMB_SIZE, interpolation=cv2.INTER_AREA)
@@ -112,6 +132,8 @@ def main():
     ap.add_argument("--log", action="store_true", help="record an episode to recordings/")
     ap.add_argument("--scene", default="home", help="free-form name stored with the episode")
     ap.add_argument("--port", type=int, default=5555, help="debug stream port of the first pipeline")
+    ap.add_argument("--control-port", type=int, default=5560, help="viewer -> Pi remote control")
+    ap.add_argument("--remote-speed", type=float, default=6.0, help="arrow-key pan/tilt speed, deg/s")
     ap.add_argument("--no-calibrate", action="store_true")
     ap.add_argument("--target-brightness", type=float, default=100)
     ap.add_argument("--servo-latency", type=float, default=0.06)
@@ -141,6 +163,7 @@ def main():
               f"model {'on' if p.model else 'off'}, streaming on tcp://*:{p.port}")
 
     pool = ThreadPoolExecutor(len(pipes))              # ONNX Runtime releases the GIL
+    control = ControlReceiver(args.control_port)
     times = collections.deque(maxlen=60)
     last_seq, dropped, use_host_clock = None, 0, False
     t_start = time.monotonic()
@@ -159,6 +182,9 @@ def main():
             if use_host_clock:
                 frame = dataclasses.replace(frame, t_sensor=frame.t_host)
 
+            for msg in control.poll():
+                for p in pipes:
+                    p.control(msg, t0)
             steps = list(pool.map(lambda p: p.step(frame, t0), pipes))
             results = [(state, eye, out) for state, eye, out, _ in steps]
             if logger:
@@ -184,6 +210,7 @@ def main():
         if logger:
             logger.close()
         pool.shutdown()
+        control.close()
         for p in pipes:
             p.pub.close()
         cam.stop()

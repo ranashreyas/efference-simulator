@@ -9,12 +9,17 @@ Layout:
     [ stats | score traces over the last 10 s (and pan angle for the panning eye)   ]
     [ "show top X% of pixels" slider                                               ]
     [ [x] remove specks of <= N pixels   N slider (1-10)                            ]
+    [ [x] remote control (panning eye): arrow keys move the eye, overriding --motion ]
 The slider filters what both heatmaps show: each pane keeps only its own strongest X% of pixels,
 so surprise and frame difference get the same pixel budget whatever their units. Display only:
 the model and the scores are unchanged. Drag it, or use - and = to step it.
 With the checkbox on, any connected cluster of N or fewer pixels that survives the slider is
 removed from both heatmaps (isolated specks of noise); with it off, the check doesn't run.
-Keys: - = slider, c speck removal on/off, , . change N, s save a snapshot, q quit
+Remote control (panning window only): when checked, the Pi stops following its --motion pattern
+and the arrow keys drive the virtual eye instead (via the Pi's control port, 5560). The checkbox
+shows the Pi's actual state, so it ticks once the Pi has switched over.
+Keys: - = slider, c speck removal on/off, , . change N, r remote control on/off,
+      arrow keys move the eye (remote control on), s save a snapshot, q quit
 """
 import argparse
 import collections
@@ -26,7 +31,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from eye.stream import DebugSubscriber  # noqa: E402
+from eye.stream import ControlSender, DebugSubscriber  # noqa: E402
 
 PANE = (480, 360)
 BAR_H = 130
@@ -172,6 +177,65 @@ class SpeckFilter:
         return out
 
 
+# cv2.waitKeyEx codes for arrow keys (macOS, then Linux/X11) -> (dx, dy)
+ARROWS = {63234: (-1, 0), 65361: (-1, 0), 63235: (1, 0), 65363: (1, 0),
+          63232: (0, 1), 65362: (0, 1), 63233: (0, -1), 65364: (0, -1)}
+
+
+class RemoteToggle:
+    """Checkbox row for driving the panning eye with the arrow keys. Clicking asks the Pi to
+    switch; the tick follows the Pi's reported state (header["remote"])."""
+
+    def __init__(self, sender):
+        self.sender = sender
+        self.top = PANE[1] + BAR_H + 2 * SLIDER_H
+        self.box = (14, 12, 34, 32)
+        self.header = {}
+
+    @property
+    def available(self):
+        return bool(self.header.get("remote_available"))
+
+    @property
+    def on(self):
+        return bool(self.header.get("remote"))
+
+    def toggle(self):
+        if self.available:
+            self.sender.send({"type": "remote", "enabled": not self.on})
+
+    def arrow(self, dx, dy):
+        if self.on:
+            self.sender.send({"type": "key", "dx": dx, "dy": dy})
+
+    def on_mouse(self, event, x, y, flags, _):
+        bx0, by0, bx1, by1 = self.box
+        if (event == cv2.EVENT_LBUTTONDOWN and self.top <= y < self.top + SLIDER_H
+                and bx0 - 4 <= x <= 600 and by0 - 4 <= y - self.top <= by1 + 4):
+            self.toggle()
+
+    def draw(self, header):
+        self.header = header
+        out = np.full((SLIDER_H, PANE[0] * 3, 3), (30, 30, 30), np.uint8)
+        mid = SLIDER_H // 2
+        bx0, by0, bx1, by1 = self.box
+        color = FG if self.available else DIM
+        cv2.rectangle(out, (bx0, by0), (bx1, by1), color, 1)
+        if self.on:
+            cv2.line(out, (bx0 + 4, mid), (bx0 + 9, by1 - 5), PAN_COLOR, 2, cv2.LINE_AA)
+            cv2.line(out, (bx0 + 9, by1 - 5), (bx1 - 3, by0 + 4), PAN_COLOR, 2, cv2.LINE_AA)
+        label(out, "remote control: arrow keys move the eye (overrides --motion)", (bx1 + 12, mid + 5), color, 0.5)
+        if not self.available:
+            text = "static eye: nothing to drive"
+        elif self.on:
+            st = header["state"]
+            text = f"ON  pan {st['pan_target']:+5.1f}  tilt {st['tilt_target']:+5.1f}  (use the arrow keys)"
+        else:
+            text = "off: following --motion"
+        label(out, text, (640, mid + 5), PAN_COLOR if self.on else color, 0.5)
+        return out
+
+
 def heat_pane(img, title):
     if img is None:
         out = np.full((PANE[1], PANE[0], 3), BG, np.uint8)
@@ -224,9 +288,10 @@ def bar(header, trace, recv_fps):
     return out
 
 
-def compose(header, images, trace, recv_fps, slider=None, specks=None):
+def compose(header, images, trace, recv_fps, slider=None, specks=None, remote=None):
     slider = slider or SensitivitySlider()
     specks = specks or SpeckFilter()
+    remote = remote or RemoteToggle(None)
     surprise, diff, cut_s, cut_d = images.get("surprise"), images.get("diff"), 0.0, 0.0
     counts_s = counts_d = None
     if surprise is not None:
@@ -239,13 +304,14 @@ def compose(header, images, trace, recv_fps, slider=None, specks=None):
                      heat_pane(surprise, "model surprise"),
                      heat_pane(diff, "frame difference (1/15 s)")])
     return np.vstack([row, bar(header, trace, recv_fps), slider.draw(cut_s, cut_d),
-                      specks.draw(counts_s, counts_d)])
+                      specks.draw(counts_s, counts_d), remote.draw(header)])
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="raspberrypi.local")
     ap.add_argument("--port", type=int, default=5555)
+    ap.add_argument("--control-port", type=int, default=5560, help="the Pi's remote-control port")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--count", type=int, default=0, help="exit after this many messages")
     args = ap.parse_args()
@@ -257,6 +323,7 @@ def main():
     window = None
     slider = SensitivitySlider()
     specks = SpeckFilter()
+    remote = RemoteToggle(ControlSender(args.host, args.control_port))
     print(f"connecting to tcp://{args.host}:{args.port} ...")
 
     while not args.count or received < args.count:
@@ -286,10 +353,17 @@ def main():
         if window is None:
             window = f"efference eye - {header['mode']} (port {args.port})"
             cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            cv2.setMouseCallback(window, lambda *a: (slider.on_mouse(*a), specks.on_mouse(*a)))
-        canvas = compose(header, images, trace, recv_fps, slider, specks)
+            cv2.setMouseCallback(window, lambda *a: (slider.on_mouse(*a), specks.on_mouse(*a),
+                                                     remote.on_mouse(*a)))
+        canvas = compose(header, images, trace, recv_fps, slider, specks, remote)
         cv2.imshow(window, canvas)
-        key = cv2.waitKey(1) & 0xFF
+        raw = cv2.waitKeyEx(1)
+        if raw in ARROWS:
+            remote.arrow(*ARROWS[raw])
+            continue
+        key = raw & 0xFF if raw != -1 else -1
+        if key == ord("r"):
+            remote.toggle()
         if key == ord("q"):
             break
         if key == ord("-"):
