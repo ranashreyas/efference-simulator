@@ -1,0 +1,18 @@
+# systemd *user* unit: the eye loop (camera + model + event capture + labeling API), restarted on
+# crash and at boot.
+# Install on the Pi (see README, "Event labeling"):
+#   mkdir -p ~/.config/systemd/user && cp deploy/*.service ~/.config/systemd/user/
+#   loginctl enable-linger $USER && systemctl --user daemon-reload
+#   systemctl --user enable --now efference-eye
+# Only one eye.run can hold the camera: `systemctl --user stop efference-eye` before running it by hand.
+[Unit]
+Description=Efference eye loop (camera, model, event capture)
+
+[Service]
+WorkingDirectory=%h/Desktop/efference-simulator
+ExecStart=%h/Desktop/efference-simulator/.venv/bin/python -u -m eye.run --actuator null virtual --motion sweep --model models/kitchen_v2.onnx --events
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

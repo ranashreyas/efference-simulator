@@ -180,6 +180,7 @@ score traces underneath (plus the pan angle for the panning eye).
 |---|---|
 | "show top % of pixels" slider (`-` `=`) | Each heatmap shows only its own strongest X% of pixels. |
 | "remove specks" checkbox (`c`) + N slider (`,` `.`) | Also hides isolated clusters of ≤ N pixels. |
+| event window (`e`), panning viewer | Browse and label the frames the Pi saved (section 7). |
 | "remote control" checkbox (`r`), panning window | Arrow keys drive the eye, overriding `--motion`. |
 | `s` / `q` | Save a snapshot / quit. |
 
@@ -245,11 +246,71 @@ copy mainly sharpens predictions. (`kitchen_v2` was trained in two stages: a sti
 model first, then 12 rounds of the recipe above starting from it. Training from scratch as in 5.3
 uses the same recipe in one go.)
 
+## 7. Event capture and labeling
+
+The Pi can save the frames where surprise spikes, so you can label them (`safe` or `motion`) and
+measure how well surprise detects real events. It is part of the eye loop: one process, one
+command. Everything is stored on the Pi's disk and survives restarts.
+
+```bash
+ssh -t $PI 'cd ~/Desktop/efference-simulator && .venv/bin/python -u -m eye.run --actuator null virtual --motion sweep --model models/kitchen_v2.onnx --events'
+```
+
+Each event is the highest-scoring frame of a stretch above `--event-threshold`, **as the triggering eye
+saw it**: the panning eye's 552×414 crop window by default (`--event-eye virtual`), or the still eye's
+centered view (`--event-eye null`), not the whole camera frame. A frame from about 1 s earlier is kept for
+context (a panning eye will have moved since). The default threshold of 60 was set from the still eye
+on held-out kitchen video; the panning eye scores higher around turnarounds, so adjust it for what
+you see, per scene. Events are at least `--event-cooldown` (30 s)
+apart. Every ~10 minutes (`--event-control-mean`) a random **control** frame is stored too, which
+the API doesn't distinguish from events. Control frames show whether the detector misses things,
+which labeling flagged frames alone can't. Everything starts `pending`; nothing is "safe" until
+someone says so.
+
+**API** (a thread inside `eye.run --events`, port `--api-port` 8787, localhost only; stored in `events/` on
+the Pi: `events.db` + `images/`):
+
+| Request | Does |
+|---|---|
+| `POST /events/fetch` | Events never handed out before, oldest first, images inline (base64 JPEG), and marks them fetched. |
+| `POST /events/<id>/label` `{"label": "safe"\|"motion"}` | Sets the label (relabeling overwrites). |
+| `GET /events?state=pending\|safe\|motion\|all&since_id=` | Metadata only, read-only. |
+| `GET /events/<id>/image?which=peak\|before&w=800` | The JPEG. |
+| `DELETE /events/<id>`, `POST /events/delete` `{"state": ..., "max_id": N}` | Permanently delete one event, or every event with a label. |
+| `GET /stats`, `GET /export` | Counts and disk used; every event with label and times (for evaluation on the Mac). |
+
+**Label in the viewer.** `viewer.view --port 5556` (the panning viewer) opens a second window, "efference
+events", by itself: three folders (Unlabelled, Safe, Motion) with counts and thumbnails, refreshed
+every 5 s. Open a folder, click a picture, press **Safe** or **Motion** (keys `1` / `2`); it moves on to
+the next picture, and a picture can be relabeled from any folder. The viewer starts an ssh tunnel to the
+Pi's API and reads the API token from the Pi over ssh (the login is `$PI`, or `--pi`). The token is
+created on the Pi the first time `--events` runs (`~/.config/efference/events.env`), so there is
+nothing else to set up. `--no-events` turns the window off, `--events` opens it from
+another viewer, `e` shows or hides it. Pictures are fetched on demand, so only the thumbnails you look
+at cross the network.
+
+**Freeing space.** The window header shows how much disk the events use. In a picture, **Delete** (`d`)
+removes it for good, and in a folder, **Delete all** empties the folder. Both need a second click
+within 4 s to confirm, and clicking anywhere else cancels. Deletion is permanent, labeled pictures
+included. Without any clicking, unlabeled pictures are removed after 7 days.
+
+All but `/health` need `Authorization: Bearer <token>`. It listens on `127.0.0.1` only, since these
+are pictures of your home: reach it through an authenticated tunnel, never a bare open port.
+Pending events are deleted after 7 days and, oldest first, past 2 GB; labeled ones are kept.
+
+**Run at boot and after a crash** (a systemd user unit in `deploy/`):
+```bash
+ssh $PI 'cd ~/Desktop/efference-simulator && mkdir -p ~/.config/systemd/user && cp deploy/*.service ~/.config/systemd/user/ && loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now efference-eye'
+```
+Stop it (`systemctl --user stop efference-eye`) before running `eye.run` by hand.
+
 ## Project layout
 
 ```
-eye/        runs on the Pi: camera, actuators and motion patterns, live model, stream, logger
+eye/        runs on the Pi: camera, actuators and motion patterns, live model, stream, logger,
+            events.py (event store + detector), api.py (labeling API, runs inside eye.run)
 viewer/     live viewer (Mac)
+deploy/     systemd units for the Pi
 tools/      record.py (record + copy to Mac), label.py (event labeler), pi_sync.sh (deploy)
 train/      prepare, virtual (simulated panning eye), model, train, compare, evaluate, export
 docs/       RECORDING.md: recording and labeling in detail

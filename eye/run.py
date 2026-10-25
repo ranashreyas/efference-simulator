@@ -17,8 +17,10 @@ copies the episode to the Mac afterwards.
 import argparse
 import collections
 import dataclasses
+import errno
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -26,6 +28,8 @@ import numpy as np
 from .actuators import (NullActuator, RandomPan, RemoteControl, ServoModel, SweepScan,
                         VirtualActuator)
 from .camera import Camera
+from .api import load_or_create_token, start_server
+from .events import EventDetector, EventSink, EventStore
 from .logger import EpisodeLogger
 from .preprocess import LOG_SIZE, MODEL_SIZE, static_model_input, to_gray_small
 from .stream import ControlReceiver, DebugPublisher
@@ -60,8 +64,11 @@ class Pipeline:
         self.model = None
         if model_path:
             from .forward import LiveForwardModel
+            from .actuators import C922_FOCAL_PX_720P
             from .motor import ACTUAL_NOISE_DEG
-            self.model = LiveForwardModel(model_path, threads=args.model_threads,
+            focal = (C922_FOCAL_PX_720P * MODEL_SIZE[0] / args.crop[0],
+                     C922_FOCAL_PX_720P * MODEL_SIZE[1] / args.crop[1]) if kind == "virtual" else None
+            self.model = LiveForwardModel(model_path, threads=args.model_threads, focal_px=focal,
                                           actual_noise_deg=ACTUAL_NOISE_DEG if kind == "virtual" else 0.0)
         self.pub = DebugPublisher(port)
         self.port = port
@@ -133,6 +140,21 @@ def main():
     ap.add_argument("--port", type=int, default=5555, help="debug stream port of the first pipeline")
     ap.add_argument("--control-port", type=int, default=5560, help="viewer -> Pi remote control")
     ap.add_argument("--remote-speed", type=float, default=6.0, help="arrow-key pan/tilt speed, deg/s")
+    ap.add_argument("--events", action="store_true",
+                    help="save surprise events (peak frame + context) to --events-dir and serve them for "
+                         "labeling on --api-port (localhost only; the viewer's event window uses it)")
+    ap.add_argument("--api-port", type=int, default=8787, help="labeling API port (localhost only)")
+    ap.add_argument("--events-dir", default=str(Path(__file__).resolve().parent.parent / "events"))
+    ap.add_argument("--event-eye", choices=["null", "virtual"], default="virtual",
+                    help="which eye's surprise triggers events, and whose view is saved: virtual = the "
+                         "panning eye's crop window (default), null = the still eye's centered view")
+    ap.add_argument("--event-threshold", type=float, default=60.0,
+                    help="surprise score that starts an event (default: ~99.9th percentile of the "
+                         "still eye on held-out kitchen video; recalibrate for other scenes)")
+    ap.add_argument("--event-min-frames", type=int, default=3, help="frames in a row above threshold to count")
+    ap.add_argument("--event-cooldown", type=float, default=30.0, help="seconds between stored events")
+    ap.add_argument("--event-control-mean", type=float, default=600.0,
+                    help="mean seconds between random unflagged control frames saved for labeling (0 = none)")
     ap.add_argument("--no-calibrate", action="store_true")
     ap.add_argument("--target-brightness", type=float, default=100)
     ap.add_argument("--servo-latency", type=float, default=0.06)
@@ -160,6 +182,33 @@ def main():
     for p in pipes:
         print(f"[run] {p.kind}: eye range ±{p.act.pan_limit:.1f}° pan, ±{p.act.tilt_limit:.1f}° tilt, "
               f"model {'on' if p.model else 'off'}, streaming on tcp://*:{p.port}")
+
+    detector = sink = event_pipe = api = None
+    if args.events:
+        try:
+            event_pipe = next((i for i, p in enumerate(pipes) if p.kind == args.event_eye), None)
+            if event_pipe is None or not pipes[event_pipe].model:
+                raise SystemExit(f"--events needs a --model and a '{args.event_eye}' actuator to score frames")
+            store = EventStore(args.events_dir)
+            sink = EventSink(store, pipes[event_pipe].kind)
+            detector = EventDetector(sink, threshold=args.event_threshold, min_frames=args.event_min_frames,
+                                     cooldown_s=args.event_cooldown, control_mean_s=args.event_control_mean)
+            api = start_server(store, load_or_create_token(), port=args.api_port)
+        except BaseException as e:                      # leave nothing running (camera, streams, recording)
+            if logger:
+                logger.close()
+            if sink:
+                sink.close()
+            for p in pipes:
+                p.pub.close()
+            cam.stop()
+            if isinstance(e, OSError) and e.errno == errno.EADDRINUSE:
+                raise SystemExit(f"[run] port {args.api_port} is already in use on this machine: an old eye.run or "
+                                 f"eye.api still running? Find it with `ss -ltnp | grep {args.api_port}`, "
+                                 f"or pick another port with --api-port") from None
+            raise
+        print(f"[run] events on: {args.event_eye} eye, threshold {args.event_threshold:g}, "
+              f"stored in {store.root} {store.counts()}; labeling API on 127.0.0.1:{args.api_port}")
 
     pool = ThreadPoolExecutor(len(pipes))              # ONNX Runtime releases the GIL
     control = ControlReceiver(args.control_port)
@@ -192,6 +241,12 @@ def main():
                     logger.add_command(cmd)
                 logger.add(frame, state)
 
+            if detector:
+                out = results[event_pipe][2]
+                # save what the triggering eye saw (its crop window), not the whole camera frame
+                detector.update(frame.t_sensor, out["surprise_score"] if out else None,
+                                results[event_pipe][1].img, frame.seq)
+
             times.append(frame.t_sensor)
             fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0.0
             header = dict(seq=frame.seq, t_sensor=frame.t_sensor, fps=round(fps, 1),
@@ -208,6 +263,11 @@ def main():
     finally:
         if logger:
             logger.close()
+        if api:
+            api.shutdown()
+        if sink:
+            sink.close()
+            print(f"[run] events stored: {sink.stored}, suppressed by cooldown: {detector.suppressed}")
         pool.shutdown()
         control.close()
         for p in pipes:

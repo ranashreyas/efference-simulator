@@ -19,7 +19,13 @@ Remote control (panning window only): when checked, the Pi stops following its -
 and the arrow keys drive the virtual eye instead (via the Pi's control port, 5560). The checkbox
 shows the Pi's actual state, so it ticks once the Pi has switched over.
 Keys: - = slider, c speck removal on/off, , . change N, r remote control on/off,
-      arrow keys move the eye (remote control on), s save a snapshot, q quit
+      arrow keys move the eye (remote control on), s save a snapshot, e event window on/off, q quit
+
+Event browser: the panning viewer also opens a second window listing the frames the Pi saved at
+surprise events in three folders (unlabelled / safe / motion), refreshed every 5 s, where you can
+open any picture and label it (viewer/events.py). It reaches the Pi by itself: an ssh tunnel to
+the Pi's localhost-only API, and the API token read from the Pi over ssh. --no-events turns it
+off, --events opens it from any viewer, --events-url skips the tunnel and uses that address.
 """
 import argparse
 import collections
@@ -247,13 +253,20 @@ def heat_pane(img, title):
     return out
 
 
+def baseline_name(header, long=False):
+    """The panning eye's baseline has its own motion removed (shift from the pan/tilt history)."""
+    if header.get("mode") == "panning":
+        return "shift-compensated diff" if long else "shift diff"
+    return "frame difference" if long else "frame diff"
+
+
 def bar(header, trace, recv_fps):
     out = np.full((BAR_H, PANE[0] * 3, 3), BG, np.uint8)
     s = header["state"]
     lines = [f"{header['mode']} eye   camera {header['fps']:.1f} fps   viewer {recv_fps:.1f} fps",
              f"model {header.get('infer_ms', '-')} ms   loop {header['proc_ms']} ms   "
              f"dropped {header['dropped']}   skipped {header.get('skipped', 0)}",
-             f"surprise {header.get('surprise_score', 0):.3g}   frame diff {header.get('diff_score', 0):.3g}"]
+             f"surprise {header.get('surprise_score', 0):.3g}   {baseline_name(header)} {header.get('diff_score', 0):.3g}"]
     if header["mode"] == "panning":
         lines.append(f"pan {s['pan']:+5.1f} (cmd {s['pan_target']:+5.1f})  "
                      f"tilt {s['tilt']:+5.1f} (cmd {s['tilt_target']:+5.1f})")
@@ -277,7 +290,7 @@ def bar(header, trace, recv_fps):
     dif = np.sqrt([p[2] for p in pts])
     draw(dif, DIFF_COLOR, 0, max(dif.max(), 1e-6))
     draw(sur, SURPRISE_COLOR, 0, max(sur.max(), 1e-6), 2)
-    names = [("surprise", SURPRISE_COLOR), ("frame diff", DIFF_COLOR)]
+    names = [("surprise", SURPRISE_COLOR), (baseline_name(header), DIFF_COLOR)]
     if header["mode"] == "panning":
         lim = header["pan_limit"] or 1
         draw([p[3] for p in pts], PAN_COLOR, -lim, lim)
@@ -302,7 +315,7 @@ def compose(header, images, trace, recv_fps, slider=None, specks=None, remote=No
         diff, counts_d = specks.apply(diff)
     row = np.hstack([actual_pane(images, header),
                      heat_pane(surprise, "model surprise"),
-                     heat_pane(diff, "frame difference (1/15 s)")])
+                     heat_pane(diff, baseline_name(header, long=True) + " (1/15 s)")])
     return np.vstack([row, bar(header, trace, recv_fps), slider.draw(cut_s, cut_d),
                       specks.draw(counts_s, counts_d), remote.draw(header)])
 
@@ -312,9 +325,34 @@ def main():
     ap.add_argument("--host", default="raspberrypi.local")
     ap.add_argument("--port", type=int, default=5555)
     ap.add_argument("--control-port", type=int, default=5560, help="the Pi's remote-control port")
+    ap.add_argument("--events", action="store_true", default=None,
+                    help="open the event browser (default: only in the panning viewer)")
+    ap.add_argument("--no-events", dest="events", action="store_false", help="never open the event browser")
+    ap.add_argument("--pi", default=os.environ.get("PI", "ranashreyas@raspberrypi.local"),
+                    help="ssh login of the Pi, for the event browser's tunnel and token (default: $PI)")
+    ap.add_argument("--api-port", type=int, default=8787, help="the eye loop's --api-port on the Pi")
+    ap.add_argument("--events-url", help="the API's address, if you tunnel yourself (needs a token)")
+    ap.add_argument("--events-token-file", help="file holding the API token (default: $EVENTS_TOKEN, "
+                                                "else read from the Pi over ssh)")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--count", type=int, default=0, help="exit after this many messages")
     args = ap.parse_args()
+
+    events = None
+
+    def make_events():
+        from pathlib import Path
+        from viewer.events import EventBrowser, Link
+        token = (Path(args.events_token_file).expanduser().read_text() if args.events_token_file
+                 else os.environ.get("EVENTS_TOKEN", "")).strip() or None
+        if args.events_url:
+            if not token:
+                sys.exit("--events-url needs the API token: set $EVENTS_TOKEN or pass --events-token-file")
+            return EventBrowser(lambda: (args.events_url, token))
+        return EventBrowser(Link(args.pi, token, args.api_port).ensure)
+
+    if args.events and not args.headless:
+        events = make_events()
 
     sub = DebugSubscriber(args.host, args.port)
     trace = collections.deque(maxlen=600)
@@ -326,13 +364,28 @@ def main():
     remote = RemoteToggle(ControlSender(args.host, args.control_port))
     print(f"connecting to tcp://{args.host}:{args.port} ...")
 
+    last_wait_msg = 0.0
     while not args.count or received < args.count:
-        msg = sub.recv_latest(timeout_ms=1000)
+        msg = sub.recv_latest(timeout_ms=30 if events else 1000)
         if msg is None:
-            print("waiting for the Pi (is `python -m eye.run` running?)")
+            if time.monotonic() - last_wait_msg > 2:
+                print("waiting for the Pi (is `python -m eye.run` running?)")
+                last_wait_msg = time.monotonic()
+            if events:                                  # the event browser works without the live stream
+                events.show()
+                raw = cv2.waitKeyEx(1)
+                key = raw & 0xFF if raw != -1 else -1
+                if key == ord("q"):
+                    break
+                if key == ord("e"):
+                    events.toggle()
+                elif key != -1:
+                    events.key(key)
             continue
         header, images = msg
         received += 1
+        if events is None and args.events is None and header["mode"] == "panning" and not args.headless:
+            events = make_events()                      # the panning viewer hosts the event browser
         if last_seq is not None and header["seq"] > last_seq + 1:
             skipped += header["seq"] - last_seq - 1
         last_seq = header["seq"]
@@ -357,11 +410,18 @@ def main():
                                                      remote.on_mouse(*a)))
         canvas = compose(header, images, trace, recv_fps, slider, specks, remote)
         cv2.imshow(window, canvas)
+        if events:
+            events.show()
         raw = cv2.waitKeyEx(1)
         if raw in ARROWS:
             remote.arrow(*ARROWS[raw])
             continue
         key = raw & 0xFF if raw != -1 else -1
+        if events and key == ord("e"):
+            events.toggle()
+            continue
+        if events and key != -1 and events.key(key):
+            continue                                    # the key was meant for the event browser
         if key == ord("r"):
             remote.toggle()
         if key == ord("q"):

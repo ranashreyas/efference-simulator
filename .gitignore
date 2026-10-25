@@ -5,3 +5,4 @@ snapshot_*.png
 recordings/
 data/
 .venv-train/
+events/
